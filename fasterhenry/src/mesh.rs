@@ -146,6 +146,27 @@ pub enum MeshError {
     },
 }
 
+/// A single (a, b) branch in the matrix-injection path
+/// ([`MeshMatrix::from_branches`]). Each branch is a node-to-node
+/// conductor; downstream adapters convert their IR's offset filaments
+/// into one Branch per strand (no sub-bundling on the matrix path -
+/// the caller's subdivide controls the discretization).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    /// Start node.
+    pub a: NodeId,
+    /// End node.
+    pub b: NodeId,
+}
+
+impl Branch {
+    /// A branch from `a` to `b`.
+    pub const fn new(a: NodeId, b: NodeId) -> Self {
+        Self { a, b }
+    }
+}
+
 /// The sparse signed loop–branch incidence matrix `M`; see the
 /// [module documentation](self).
 #[derive(Clone, Debug, PartialEq)]
@@ -171,7 +192,60 @@ impl MeshMatrix {
         filaments_per_segment: &[usize],
         ports: &[Port],
     ) -> Result<Self, MeshError> {
-        let defs = geometry.segment_defs();
+        Self::build_inner(
+            geometry.nodes().len(),
+            geometry.segment_defs(),
+            filaments_per_segment,
+            ports,
+        )
+    }
+
+    /// Builds the loop basis from a custom branch list (the matrix-injection
+    /// path - `peec-solve::FasterhenryMatrixSolver`). Each branch is a
+    /// `(a, b)` node pair; the total `node_count` defines the forest's
+    /// universe (the caller's IR owns the node addressing). Every branch
+    /// contributes exactly **one** parallel filament (no sub-bundling on
+    /// this path - the caller's subdivide controls the discretization).
+    ///
+    /// # Errors
+    ///
+    /// A [`MeshError`] if the ports do not fit the branch graph
+    /// (`NoPorts`, `UnknownPortNode`, `DegeneratePort`,
+    /// `PortNotConnected`).
+    pub fn from_branches(
+        branches: &[Branch],
+        node_count: usize,
+        ports: &[Port],
+    ) -> Result<Self, MeshError> {
+        if branches.is_empty() {
+            // The matrix path always passes at least one branch per
+            // filament. With zero branches the inner logic would
+            // SegmentCountMismatch (expected 0, got 0); we surface a
+            // clearer empty-branches error here.
+            return Err(MeshError::SegmentCountMismatch {
+                expected: 0,
+                got: 0,
+            });
+        }
+        // Build a minimal `SegmentDef` vector for the forest / loop basis.
+        // The dimensions are placeholders (`1.0, 1.0, 1.0`); the loop
+        // basis only needs the (a, b) connectivity graph.
+        let defs: Vec<SegmentDef> = branches
+            .iter()
+            .map(|b| SegmentDef::new(b.a, b.b, 1.0, 1.0, 1.0))
+            .collect();
+        let filaments_per_branch: Vec<usize> = vec![1; branches.len()];
+        Self::build_inner(node_count, &defs, &filaments_per_branch, ports)
+    }
+
+    /// Inner loop-basis builder - the shared logic between [`build`] and
+    /// [`from_branches`]. Public callers should prefer those two.
+    fn build_inner(
+        node_count: usize,
+        defs: &[SegmentDef],
+        filaments_per_segment: &[usize],
+        ports: &[Port],
+    ) -> Result<Self, MeshError> {
         if filaments_per_segment.len() != defs.len() {
             return Err(MeshError::SegmentCountMismatch {
                 expected: defs.len(),
@@ -201,7 +275,7 @@ impl MeshMatrix {
             rows.extend((1..n).map(|k| vec![(first + k, 1.0), (first, -1.0)]));
         }
 
-        let forest = Forest::grow(geometry.nodes().len(), defs);
+        let forest = Forest::grow(node_count, defs);
         for (s, def) in defs.iter().enumerate() {
             if !forest.in_tree[s] {
                 // Forwards along the segment, then home through the forest.
@@ -212,7 +286,6 @@ impl MeshMatrix {
         }
         let internal_count = rows.len();
 
-        let node_count = geometry.nodes().len();
         for (port, p) in ports.iter().enumerate() {
             let (positive, negative) = (p.positive.0, p.negative.0);
             if let Some(&node) = [positive, negative].iter().find(|&&n| n >= node_count) {

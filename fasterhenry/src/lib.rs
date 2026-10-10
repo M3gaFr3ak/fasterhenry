@@ -91,7 +91,7 @@ pub use inductance::{
     MU0,
 };
 pub use iterative::{IterativeParams, IterativeSolution, IterativeSystem};
-pub use mesh::{MeshError, MeshMatrix, Port};
+pub use mesh::{Branch, MeshError, MeshMatrix, Port};
 pub use pfft::{GridSpacing, PfftError, PfftOperator, PfftParams, PfftStats};
 pub use result::{Counts, Provenance, SweepResult, Timing};
 pub use solve::{

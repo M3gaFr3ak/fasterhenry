@@ -671,6 +671,84 @@ impl MeshSystem {
         Self::assemble_with_coupling(geometry, ports, discretization, &Coupling::all_pairs())
     }
 
+    /// Builds the mesh system from a precomputed branch-resistance
+    /// matrix `r`, partial-inductance matrix `l`, and loop basis `mesh` -
+    /// the matrix-injection path (`peec-solve::FasterhenryMatrixSolver`).
+    ///
+    /// The `branches` carry the `Filament`s for the per-filament `R`
+    /// accessor + the `mesh`'s loop basis (built via
+    /// [`MeshMatrix::from_branches`]). The `counts` is **mandatory**:
+    /// the matrix path has no `Geometry` source for
+    /// `Counts.nodes` / `Counts.segments` (in the matrix path
+    /// `Counts.segments == branch_count`; see the peec-solve audit D-3
+    /// + BP#1 fold).
+    ///
+    /// `r` and `l` are **branch** matrices (n x n where n = `branches.len()`).
+    /// They are reduced to mesh quantities internally via the existing
+    /// [`congruence`] helper - pass branch `R` / branch `L`, NOT
+    /// pre-reduced mesh blocks (sweep consumes the pre-reduced
+    /// `r_ee..l_pp`).
+    ///
+    /// # Panics
+    ///
+    /// In debug builds if `mesh.branch_count() != branches.len()`, or if
+    /// `r` / `l`'s shape doesn't match `branches.len()`.
+    pub fn from_matrices(
+        branches: Vec<Filament>,
+        r: DMatrix<f64>,
+        l: DMatrix<f64>,
+        mesh: MeshMatrix,
+        ports: Vec<Port>,
+        counts: Counts,
+    ) -> Result<Self, SolveError> {
+        let n = branches.len();
+        debug_assert_eq!(
+            mesh.branch_count(),
+            n,
+            "mesh.branch_count must match branches.len (matrix path)"
+        );
+        debug_assert_eq!(r.nrows(), n, "r must be n x n where n = branches.len");
+        debug_assert_eq!(r.ncols(), n, "r must be n x n where n = branches.len");
+        debug_assert_eq!(l.nrows(), n, "l must be n x n where n = branches.len");
+        debug_assert_eq!(l.ncols(), n, "l must be n x n where n = branches.len");
+
+        // Per-filament R from the diagonal of `r` (the off-diagonal
+        // entries of `r` are not used by `congruence`; we surface them
+        // through `filament_resistances()` for the accessor).
+        let resistances: Vec<f64> = (0..n).map(|i| r[(i, i)]).collect();
+
+        // Reduce the branch matrices to mesh quantities via the existing
+        // `congruence` helper.
+        let r_mesh = congruence(&mesh, n, |branch, sign, row| {
+            row[branch] += sign * resistances[branch];
+        });
+        let l_mesh = congruence(&mesh, n, |branch, sign, row| {
+            for (slot, value) in row.iter_mut().zip(l.column(branch).iter()) {
+                *slot += sign * value;
+            }
+        });
+
+        let (internal, port_count) = (mesh.internal_count(), mesh.port_count());
+        let block = |m: &DMatrix<f64>, r0, c0, nr, nc| m.view((r0, c0), (nr, nc)).into_owned();
+
+        Ok(Self {
+            ports,
+            filaments: branches,
+            resistances,
+            mesh,
+            r_ee: block(&r_mesh, 0, 0, internal, internal),
+            r_ep: block(&r_mesh, 0, internal, internal, port_count),
+            r_pp: block(&r_mesh, internal, internal, port_count, port_count),
+            l_ee: block(&l_mesh, 0, 0, internal, internal),
+            l_ep: block(&l_mesh, 0, internal, internal, port_count),
+            l_pp: block(&l_mesh, internal, internal, port_count, port_count),
+            counts,
+            truncation_warnings: Vec::new(),
+            inductance_seconds: 0.0,
+            assembly_seconds: 0.0,
+        })
+    }
+
     /// [`assemble`](Self::assemble) with the mutual inductance of uncoupled
     /// conductor groups truncated to zero.
     ///
