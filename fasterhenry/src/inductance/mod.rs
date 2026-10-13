@@ -68,7 +68,8 @@ pub use batch::{
     mutual_batch, mutual_batch_detailed, mutual_batch_detailed_with, mutual_batch_with,
     partial_inductance_matrix, partial_inductance_matrix_detailed,
     partial_inductance_matrix_masked, partial_inductance_matrix_masked_with,
-    partial_inductance_method_counts, Execution, MethodCounts, MutualBatch, PairMask,
+    partial_inductance_method_counts, partial_inductance_method_counts_with, Execution,
+    MethodCounts, MutualBatch, PairMask,
 };
 
 /// Vacuum permeability `μ0 = 4π × 10⁻⁷ H/m` (the classical defined value,

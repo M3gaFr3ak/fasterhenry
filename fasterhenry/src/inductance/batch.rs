@@ -1,5 +1,7 @@
 //! Batched evaluation of partial-inductance matrices.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use nalgebra::DMatrix;
 use rayon::prelude::*;
 
@@ -384,7 +386,28 @@ impl MethodCounts {
 pub fn partial_inductance_method_counts(
     filaments: &[Filament],
 ) -> Result<MethodCounts, KernelError> {
+    partial_inductance_method_counts_with(filaments, |_, _| {})
+}
+
+/// [`partial_inductance_method_counts`] with a progress reporter.
+///
+/// `report(done_rows, total_rows)` is called from the pool threads as each
+/// upper-triangle row completes. A count over a real board mesh is billions of
+/// pair dispatches and otherwise a silent black box; the reporter is the only
+/// sign of life. Throttling (e.g. print every few percent) is the caller's job.
+///
+/// # Errors
+///
+/// As [`partial_inductance_method_counts`].
+pub fn partial_inductance_method_counts_with<F>(
+    filaments: &[Filament],
+    report: F,
+) -> Result<MethodCounts, KernelError>
+where
+    F: Fn(usize, usize) + Sync,
+{
     let n = filaments.len();
+    let done = AtomicUsize::new(0);
     // Per-row tallies, then a fold: no global lock, and independent of the
     // thread count. The rows are O(n) to hold, not O(n²).
     let rows: Vec<MethodCounts> = (0..n)
@@ -395,6 +418,10 @@ pub fn partial_inductance_method_counts(
                 let m = evaluate(&filaments[i], &filaments[j], true).map_err(|e| e.at(i, j))?;
                 c.add(m.method);
             }
+            // Every `d` is unique (fetch_add), so the reporter sees each row
+            // exactly once even across the pool.
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            report(d, n);
             Ok(c)
         })
         .collect::<Result<_, KernelError>>()?;
