@@ -3,7 +3,7 @@
 use nalgebra::DMatrix;
 use rayon::prelude::*;
 
-use super::{evaluate, KernelError, Mutual};
+use super::{evaluate, KernelError, Method, Mutual};
 use crate::filament::Filament;
 
 /// How a batch is executed. [`mutual_batch`] uses [`Execution::Parallel`];
@@ -315,6 +315,95 @@ pub fn partial_inductance_matrix_detailed(
         }),
         unresolved_pairs,
     })
+}
+
+/// How many partial inductances of a filament set took each evaluation path
+/// ([`Method`]), counted over the upper triangle (unordered pairs, including
+/// the `n` self terms). Produced by
+/// [`partial_inductance_method_counts`](partial_inductance_method_counts) as
+/// the Hoer-Love fallback profile of a mesh against the kernel dispatch (the
+/// spec 7.2 test-4 count).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MethodCounts {
+    /// [`Method::Orthogonal`]: exactly zero.
+    pub orthogonal: usize,
+    /// [`Method::BarClosedForm`]: the 64-term Hoer-Love/Ruehli closed form.
+    pub bar_closed_form: usize,
+    /// [`Method::AlignedQuadrature`]: the closed form's rounding-error
+    /// fallback. `aligned_quadrature` alone is the Hoer-Love fallback count;
+    /// `bar_closed_form + aligned_quadrature` is the aligned-bar total.
+    pub aligned_quadrature: usize,
+    /// [`Method::PointQuadrature`]: adaptive-order volume quadrature.
+    pub point_quadrature: usize,
+    /// [`Method::SampledFilaments`]: cross-section sampling.
+    pub sampled_filaments: usize,
+}
+
+impl MethodCounts {
+    /// Unordered pairs counted, `n·(n+1)/2` — the sum of every field.
+    pub fn total(&self) -> usize {
+        self.orthogonal
+            + self.bar_closed_form
+            + self.aligned_quadrature
+            + self.point_quadrature
+            + self.sampled_filaments
+    }
+
+    fn add(&mut self, method: Method) {
+        match method {
+            Method::Orthogonal => self.orthogonal += 1,
+            Method::BarClosedForm => self.bar_closed_form += 1,
+            Method::AlignedQuadrature => self.aligned_quadrature += 1,
+            Method::PointQuadrature => self.point_quadrature += 1,
+            Method::SampledFilaments => self.sampled_filaments += 1,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.orthogonal += other.orthogonal;
+        self.bar_closed_form += other.bar_closed_form;
+        self.aligned_quadrature += other.aligned_quadrature;
+        self.point_quadrature += other.point_quadrature;
+        self.sampled_filaments += other.sampled_filaments;
+    }
+}
+
+/// [`partial_inductance_matrix`] reduced to a histogram of the [`Method`] used
+/// for each unordered pair (upper triangle, including the `n` self terms): the
+/// Hoer-Love fallback profile of a mesh against the kernel dispatch (the spec
+/// 7.2 test-4 count).
+///
+/// Unlike [`partial_inductance_matrix_detailed`], this never builds the matrix.
+/// It dispatches each pair, tallies its [`Method`], and drops the value, so
+/// peak memory is O(threads), not O(n²) — usable on a real board mesh where a
+/// dense matrix would not fit.
+///
+/// # Errors
+///
+/// As [`partial_inductance_matrix`], attributed to the evaluated pair.
+pub fn partial_inductance_method_counts(
+    filaments: &[Filament],
+) -> Result<MethodCounts, KernelError> {
+    let n = filaments.len();
+    // Per-row tallies, then a fold: no global lock, and independent of the
+    // thread count. The rows are O(n) to hold, not O(n²).
+    let rows: Vec<MethodCounts> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut c = MethodCounts::default();
+            for j in i..n {
+                let m = evaluate(&filaments[i], &filaments[j], true).map_err(|e| e.at(i, j))?;
+                c.add(m.method);
+            }
+            Ok(c)
+        })
+        .collect::<Result<_, KernelError>>()?;
+    Ok(rows
+        .into_iter()
+        .fold(MethodCounts::default(), |mut acc, c| {
+            acc.merge(c);
+            acc
+        }))
 }
 
 /// [`partial_inductance_matrix`] with the pairs a [`PairMask`] rejects

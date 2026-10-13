@@ -87,8 +87,8 @@ pub use gmres::{GmresOutcome, GmresParams};
 pub use inductance::{
     mutual_batch, mutual_batch_detailed, mutual_inductance, partial_inductance_matrix,
     partial_inductance_matrix_detailed, partial_inductance_matrix_masked,
-    partial_inductance_matrix_masked_with, self_inductance, KernelError, MutualBatch, PairMask,
-    MU0,
+    partial_inductance_matrix_masked_with, partial_inductance_method_counts, self_inductance,
+    KernelError, MethodCounts, MutualBatch, PairMask, MU0,
 };
 pub use iterative::{IterativeParams, IterativeSolution, IterativeSystem};
 pub use mesh::{Branch, MeshError, MeshMatrix, Port};

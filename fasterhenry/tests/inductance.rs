@@ -20,8 +20,8 @@ use fasterhenry::inductance::{
 };
 use fasterhenry::{
     discretize, mutual_batch, mutual_batch_detailed, mutual_inductance, partial_inductance_matrix,
-    partial_inductance_matrix_detailed, self_inductance, Filament, KernelError, MutualBatch, Node,
-    Segment, MU0,
+    partial_inductance_matrix_detailed, partial_inductance_method_counts, self_inductance,
+    Filament, KernelError, MutualBatch, Node, Segment, MU0,
 };
 use nalgebra::{DMatrix, Vector3};
 
@@ -1071,4 +1071,37 @@ fn random_pairs_are_finite_symmetric_and_obey_cauchy_schwarz() {
             "{method:?} never used: {methods:?}"
         );
     }
+}
+
+#[test]
+fn method_counts_tally_the_upper_triangle() {
+    // Two parallel +x bars and one +y bar (orthogonal to both). The
+    // histogram must cover exactly the upper-triangle unordered pair count
+    // `n·(n+1)/2`, and the method split must be honest: the two crossing
+    // pairs are exactly zero, and every self term takes an aligned method.
+    let bar = |a: [f64; 3], b: [f64; 3]| {
+        let seg = Segment::new(
+            Node::new(a[0], a[1], a[2]),
+            Node::new(b[0], b[1], b[2]),
+            1e-3,
+            1e-3,
+            COPPER,
+        );
+        discretize(&seg, 1, 1).unwrap().pop().unwrap()
+    };
+    let fils = vec![
+        bar([0.0; 3], [10e-3, 0.0, 0.0]),
+        bar([0.0, 5e-3, 0.0], [10e-3, 5e-3, 0.0]),
+        bar([5e-3, -1e-3, 0.0], [5e-3, 1e-3, 0.0]),
+    ];
+    let counts = partial_inductance_method_counts(&fils).unwrap();
+    let n = fils.len();
+    assert_eq!(counts.total(), n * (n + 1) / 2, "{counts:?}");
+    // The two crossing pairs (each +x bar vs the +y bar) are orthogonal.
+    assert_eq!(counts.orthogonal, 2, "{counts:?}");
+    // The 3 self terms take the Hoer-Love closed form at a 10:1:1 aspect.
+    assert!(
+        counts.bar_closed_form >= 3,
+        "self terms should be BarClosedForm: {counts:?}"
+    );
 }
