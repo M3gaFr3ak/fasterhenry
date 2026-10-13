@@ -339,16 +339,44 @@ pub struct MethodCounts {
     pub point_quadrature: usize,
     /// [`Method::SampledFilaments`]: cross-section sampling.
     pub sampled_filaments: usize,
+    /// Self terms (a bar with itself) counted in [`Self::bar_closed_form`].
+    /// Self pairs are always aligned, so this is a subset of
+    /// `bar_closed_form`; splitting it out separates the single-bar (self)
+    /// behavior from the pair (mutual) behavior.
+    pub self_bar_closed_form: usize,
+    /// Self terms counted in [`Self::aligned_quadrature`] (the single-bar
+    /// Hoer-Love fallback). A subset of `aligned_quadrature`.
+    pub self_aligned_quadrature: usize,
 }
 
 impl MethodCounts {
-    /// Unordered pairs counted, `n·(n+1)/2` — the sum of every field.
+    /// Unordered pairs counted, `n·(n+1)/2` — the sum of the five `Method`
+    /// fields. The `self_*` fields are a subset of the aligned fields (a self
+    /// pair is always aligned), so they do not add to this total.
     pub fn total(&self) -> usize {
         self.orthogonal
             + self.bar_closed_form
             + self.aligned_quadrature
             + self.point_quadrature
             + self.sampled_filaments
+    }
+
+    /// Self terms (a bar with itself) — always aligned.
+    pub fn self_terms(&self) -> usize {
+        self.self_bar_closed_form + self.self_aligned_quadrature
+    }
+
+    /// The Hoer-Love fallback count over **mutual** pairs only (self terms
+    /// excluded): the `AlignedQuadrature` entries that are not self pairs.
+    pub fn mutual_fallback(&self) -> usize {
+        self.aligned_quadrature - self.self_aligned_quadrature
+    }
+
+    /// Aligned pairs (`BarClosedForm + AlignedQuadrature`) over **mutual**
+    /// pairs only (self terms excluded). The denominator for a mutual-only
+    /// fallback rate.
+    pub fn mutual_aligned(&self) -> usize {
+        (self.bar_closed_form + self.aligned_quadrature) - self.self_terms()
     }
 
     fn add(&mut self, method: Method) {
@@ -361,12 +389,25 @@ impl MethodCounts {
         }
     }
 
+    /// Tally a self pair (a bar with itself) — a subset of the aligned fields.
+    /// Self pairs are always aligned (a bar is trivially aligned with itself),
+    /// so only the two aligned methods are recorded here.
+    fn add_self(&mut self, method: Method) {
+        match method {
+            Method::BarClosedForm => self.self_bar_closed_form += 1,
+            Method::AlignedQuadrature => self.self_aligned_quadrature += 1,
+            _ => {}
+        }
+    }
+
     fn merge(&mut self, other: Self) {
         self.orthogonal += other.orthogonal;
         self.bar_closed_form += other.bar_closed_form;
         self.aligned_quadrature += other.aligned_quadrature;
         self.point_quadrature += other.point_quadrature;
         self.sampled_filaments += other.sampled_filaments;
+        self.self_bar_closed_form += other.self_bar_closed_form;
+        self.self_aligned_quadrature += other.self_aligned_quadrature;
     }
 }
 
@@ -417,6 +458,11 @@ where
             for j in i..n {
                 let m = evaluate(&filaments[i], &filaments[j], true).map_err(|e| e.at(i, j))?;
                 c.add(m.method);
+                if i == j {
+                    // The self pair (a bar with itself) is a subset of the
+                    // aligned fields; record it to split self from mutual.
+                    c.add_self(m.method);
+                }
             }
             // Every `d` is unique (fetch_add), so the reporter sees each row
             // exactly once even across the pool.

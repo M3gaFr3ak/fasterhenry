@@ -1104,4 +1104,15 @@ fn method_counts_tally_the_upper_triangle() {
         counts.bar_closed_form >= 3,
         "self terms should be BarClosedForm: {counts:?}"
     );
+    // The self/mutual split: all n self terms are aligned, and here they all
+    // stay in the closed form (no self fallback at a 10:1:1 aspect).
+    assert_eq!(counts.self_terms(), n, "{counts:?}");
+    assert_eq!(counts.self_bar_closed_form, n, "{counts:?}");
+    assert_eq!(counts.self_aligned_quadrature, 0, "{counts:?}");
+    // The mutual-only denominator excludes the n self terms.
+    assert_eq!(
+        counts.mutual_aligned(),
+        counts.bar_closed_form + counts.aligned_quadrature - n,
+        "{counts:?}"
+    );
 }
