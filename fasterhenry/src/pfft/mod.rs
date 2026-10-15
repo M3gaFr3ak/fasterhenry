@@ -165,7 +165,7 @@ use near::NearField;
 
 /// Largest padded FFT grid the operator will allocate, in points (each a
 /// 16-byte complex number, several buffers of which exist at once).
-pub const MAX_FFT_POINTS: usize = 1 << 26;
+pub const MAX_FFT_POINTS: usize = 1 << 28;
 
 /// Filaments per parallel task in the per-filament passes of
 /// [`PfftOperator::apply`].
