@@ -168,6 +168,7 @@ where
             g[j] = gj.scale(c);
             g[j + 1] = -(s.conjugate() * gj);
             hessenberg.push(column);
+            eprintln!("gmres: iter {iterations}, |r| ~ {:.3e}", g[j + 1].modulus());
 
             // `next_norm == 0` is a lucky breakdown: the Krylov space is
             // invariant and the least-squares solution is exact.

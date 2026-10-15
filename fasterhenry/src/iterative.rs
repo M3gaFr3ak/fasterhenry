@@ -352,9 +352,22 @@ impl IterativeSystem {
             + 4 * fft_points * 16;
         let concurrent = (SWEEP_MEMORY_BUDGET_BYTES / bytes_per_solve.max(1)).max(1);
 
+        // Progress: one marker per frequency. The sweep is concurrent within a
+        // memory-budget chunk, so the "done k/N" counter is the reliable signal.
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let total = frequencies.len();
         let mut impedance = Vec::with_capacity(frequencies.len());
         for chunk in frequencies.chunks(concurrent) {
-            let solved: Vec<_> = chunk.par_iter().map(|&f| self.impedance(f)).collect();
+            let solved: Vec<_> = chunk
+                .par_iter()
+                .map(|&f| {
+                    eprintln!("sweep: solving f = {f:e} Hz ...");
+                    let z = self.impedance(f);
+                    let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    eprintln!("sweep: freq {d}/{total} done (f = {f:e} Hz)");
+                    z
+                })
+                .collect();
             for z in solved {
                 impedance.push(z?);
             }
