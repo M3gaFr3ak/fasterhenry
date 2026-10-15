@@ -381,8 +381,11 @@ impl PfftOperator {
         }
         let radius = params.near_field_radius * spacing;
 
+        eprintln!("pfft: projecting {} filaments to the grid ...", n);
         let projections = grid::project_all(&grid, filaments, radius);
+        eprintln!("pfft: enumerating near-field pairs ...");
         let pairs = near::near_pairs(filaments, radius);
+        eprintln!("pfft: precorrecting near-field (exact kernels) ...");
         let near = near::precorrect(filaments, &grid, &projections, &pairs)?;
 
         let mut projection_offsets = Vec::with_capacity(n + 1);
@@ -426,6 +429,7 @@ impl PfftOperator {
             .filter(|&c| directions.iter().any(|d| d[c] != 0.0))
             .collect();
         let h = grid.spacing;
+        eprintln!("pfft: planning FFT convolver ...");
         let convolver = Convolver::new(grid.dims, |d| near::grid_kernel(d, h));
 
         Ok(Self {

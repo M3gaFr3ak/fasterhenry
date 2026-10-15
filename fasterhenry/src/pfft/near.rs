@@ -247,9 +247,20 @@ pub(crate) fn precorrect(
         .reduce(|| [0; 3], |a, b| [0, 1, 2].map(|k| a[k].max(b[k])));
     let table = KernelTable::new(reach, grid.spacing);
 
+    // Progress: the precorrection kernel loop is the dominant set-up cost
+    // (~75%); report every ~5% so a large build is not a silent hang.
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let step = (n / 20).max(1);
     let upper: Vec<Vec<(u32, f64)>> = (0..n)
         .into_par_iter()
-        .map(|i| row(i, filaments, grid, projections, &partners[i], &table))
+        .map(|i| {
+            let r = row(i, filaments, grid, projections, &partners[i], &table);
+            let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if d % step == 0 || d == n {
+                eprintln!("pfft: precorrect {d}/{n}");
+            }
+            r
+        })
         .collect::<Result<_, _>>()?;
     // Mirror the upper triangle into full rows.
     let mut counts = vec![0usize; n];
