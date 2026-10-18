@@ -469,9 +469,22 @@ use faer::traits::ComplexField as FaerComplexField;
 /// near-pair mutuals (non-orthogonal upper triangle), self terms, and
 /// branch incidence (which internal rows contain which branch).
 struct NearPairData {
-    partners: Vec<Vec<(u32, f64)>>,
+    /// Near partners in BOTH directions (the upper-triangle mutual list
+    /// mirrored), each pair's kernel computed exactly once.
+    partner_all: Vec<Vec<(u32, f64)>>,
     self_l: Vec<f64>,
-    branch_rows: Vec<Vec<u32>>,
+    /// Incidence of each branch: internal rows containing it plus the
+    /// basis sign, cached against 202-wide `mesh.row` rescans.
+    branch_rows: Vec<Vec<BranchIncidence>>,
+}
+
+/// Incidence of branch `a`: the internal rows containing it, with the row
+/// basis's own sign per incidence. Cached so the column accumulator never
+/// rescans `mesh.row(i)` (rows reach 202 branches wide).
+#[derive(Clone)]
+struct BranchIncidence {
+    row: u32,
+    sign: f64,
 }
 
 fn near_pair_data(
@@ -500,15 +513,37 @@ fn near_pair_data(
     for list in &mut partners {
         list.sort_by_key(|&(p, _)| p);
     }
-    let self_l: Vec<f64> = filaments.iter().map(self_inductance).collect();
-    let mut branch_rows: Vec<Vec<u32>> = vec![Vec::new(); branches];
-    for row in 0..internal {
-        for &(b, _) in mesh.row(row) {
-            branch_rows[b].push(row as u32);
+    // Mirror the upper triangle into both directions so a column scan
+    // sees every partner of its branches without an adjacency transpose
+    // per column.
+    let mut partner_all: Vec<Vec<(u32, f64)>> = partners.clone();
+    for a in 0..branches {
+        for &(b, l) in &partners[a] {
+            partner_all[b as usize].push((a as u32, l));
         }
     }
+    for list in &mut partner_all {
+        list.sort_by_key(|&(p, _)| p);
+    }
+    let self_l: Vec<f64> = filaments.iter().map(self_inductance).collect();
+    let mut branch_rows: Vec<Vec<BranchIncidence>> = vec![Vec::new(); branches];
+    for row in 0..internal {
+        for &(b, sign) in mesh.row(row) {
+            branch_rows[b].push(BranchIncidence {
+                row: row as u32,
+                sign,
+            });
+        }
+    }
+    let row_nnz_max = (0..internal).map(|r| mesh.row(r).len()).max().unwrap_or(0);
+    let row_nnz_sum: usize = (0..internal).map(|r| mesh.row(r).len()).sum();
+    let branch_rows_max = branch_rows.iter().map(|v| v.len()).max().unwrap_or(0);
+    let branch_rows_sum: usize = branch_rows.iter().map(|v| v.len()).sum();
+    eprintln!(
+        "cubel-global: M stats: rows {internal}, M nnz sum {row_nnz_sum}, max {row_nnz_max}; branch_rows sum {branch_rows_sum}, max {branch_rows_max}"
+    );
     Ok(NearPairData {
-        partners,
+        partner_all,
         self_l,
         branch_rows,
     })
@@ -520,12 +555,12 @@ impl CubelGlobal {
         self.n
     }
 
-    /// Builds the pattern and the once-only symbolic factorization.
-    /// Contributions are gathered without mirroring: a branch pair (a, b)
-    /// keeps `b > a` (upper triangle), so a row-pair whose only
-    /// incidence runs (b in row i, a in row j) still appears, from row
-    /// j's own scan, as the transpose entry. Symmetric values emerge
-    /// from the natural incidence sums; nothing is manually mirrored.
+    /// Builds the pattern and the once-only symbolic factorization. The
+    /// branch-pair kernel list is computed once from the upper triangle
+    /// and mirrored into both directions; columns of `S` are swept one
+    /// at a time over a dense accumulator (duplicates merge during the
+    /// sweep), so peak memory is CSC + O(n) scratch, never the expansion
+    /// multiset.
     pub(crate) fn build(
         mesh: &MeshMatrix,
         filaments: &[Filament],
@@ -546,75 +581,102 @@ impl CubelGlobal {
         }
         let wall = std::time::Instant::now();
         let pattern = near_pair_data(mesh, filaments, internal, near_radius)?;
+        let partner_total: usize = pattern.partner_all.iter().map(|p| p.len()).sum();
+        eprintln!(
+            "cubel-global: near pairs {partner_total} directed (avg {} per branch, wall {:.3} s)",
+            partner_total / filaments.len().max(1),
+            wall.elapsed().as_secs_f64(),
+        );
         eprintln!(
             "cubel-global: pattern: {internal} rows, {} branches, radius {:.3e} m",
             filaments.len(),
             near_radius,
         );
 
-        // Column-keyed contributions: (col, row, re, im).
-        let mut coo: Vec<(u32, u32, f64, f64)> = Vec::new();
-        for row in 0..internal {
-            for &(a, sign_a) in mesh.row(row) {
+        // Column-keyed assembly over a per-column dense accumulator.
+        // These decks' mesh rows carry ~100+ branches, so the branch-pair
+        // -> row-pair expansion of M Z M^T is a ~30:1 duplicate multiset;
+        // the earlier sort-then-merge over a materialized (col, row)
+        // multiset reached 2.2e9 entries = an OOM before the merge could
+        // run. The accumulator merges duplicates during the sweep, so
+        // peak memory is the CSC result plus O(n) scratch.
+        let mut col_ptr: Vec<u32> = vec![0; internal + 1];
+        let mut row_idx: Vec<u32> = Vec::new();
+        let mut re_part: Vec<f64> = Vec::new();
+        let mut im_part: Vec<f64> = Vec::new();
+        let mut acc_re = vec![0.0f64; internal];
+        let mut acc_im = vec![0.0f64; internal];
+        let mut touched = vec![false; internal];
+        let mut visited: Vec<u32> = Vec::new();
+        let mut peak_col = 0usize;
+        for col in 0..internal {
+            for &(a, sign_a) in mesh.row(col) {
                 // Shared branch `a`: the resistance half (omega-free,
                 // diagonal in branch space) and the self inductance; every
                 // row containing `a` couples through it.
-                let za_re = *resistances.get(a).unwrap_or(&0.0);
-                let za_im = pattern.self_l[a];
-                for &j in &pattern.branch_rows[a] {
-                    let sign_j = sign_of(mesh.row(j as usize), a);
-                    let prod = sign_a * sign_j;
-                    coo.push((j as u32, row as u32, prod * za_re, prod * za_im));
+                let re_a = *resistances.get(a).unwrap_or(&0.0);
+                let l_self = pattern.self_l[a];
+                for inc in &pattern.branch_rows[a] {
+                    let i = inc.row as usize;
+                    let prod = sign_a * inc.sign;
+                    if !touched[i] {
+                        touched[i] = true;
+                        visited.push(i as u32);
+                    }
+                    acc_re[i] += prod * re_a;
+                    acc_im[i] += prod * l_self;
                 }
-                // Near partners `b > a`: exact inductance, omega-free
-                // values; the omega scale joins at factor time.
-                for &(b, l_ab) in &pattern.partners[a] {
-                    for &j in &pattern.branch_rows[b as usize] {
-                        let sign_j = sign_of(mesh.row(j as usize), b as usize);
-                        let prod = sign_a * sign_j;
-                        coo.push((j as u32, row as u32, 0.0, prod * l_ab));
+                // Near partners in both directions (upper-triangle exact
+                // mutuals, mirrored): pure inductance, the omega scale
+                // joins at factor time.
+                for &(other, l) in &pattern.partner_all[a] {
+                    for inc in &pattern.branch_rows[other as usize] {
+                        let i = inc.row as usize;
+                        let prod = sign_a * inc.sign;
+                        if !touched[i] {
+                            touched[i] = true;
+                            visited.push(i as u32);
+                        }
+                        acc_im[i] += prod * l;
                     }
                 }
             }
-        }
-
-        // Sort by (col, row), then merge duplicates by summation: the
-        // row-column gather semantics of M Z M^T, just sorted once.
-        coo.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
-        let mut col_ptr: Vec<u32> = vec![0; internal + 1];
-        let mut row_idx: Vec<u32> = Vec::with_capacity(coo.len());
-        let mut re_part: Vec<f64> = Vec::with_capacity(coo.len());
-        let mut im_part: Vec<f64> = Vec::with_capacity(coo.len());
-        let mut last = (u32::MAX, u32::MAX);
-        let mut cur = 1u32;
-        for &(col, row, re, im) in &coo {
-            if (col, row) == last {
-                let n = row_idx.len() - 1;
-                re_part[n] += re;
-                im_part[n] += im;
+            if visited.is_empty() {
+                col_ptr[col + 1] = row_idx.len() as u32;
                 continue;
             }
-            // A new populated column closes off every column before it:
-            // their slot value is the current offset (start of column
-            // `cur`, end of the previous content; empty columns get
-            // start = end).
-            while cur <= col {
-                col_ptr[cur as usize] = row_idx.len() as u32;
-                cur += 1;
+            // CSC wants ascending rows per column; `visited` collects in
+            // incidence order.
+            visited.sort_unstable();
+            for &i in &visited {
+                row_idx.push(i);
+                re_part.push(acc_re[i as usize]);
+                im_part.push(acc_im[i as usize]);
             }
-            row_idx.push(row);
-            re_part.push(re);
-            im_part.push(im);
-            last = (col, row);
-        }
-        while cur < internal as u32 + 1 {
-            col_ptr[cur as usize] = row_idx.len() as u32;
-            cur += 1;
+            col_ptr[col + 1] = row_idx.len() as u32;
+            peak_col = peak_col.max(visited.len());
+            for &i in &visited {
+                let i = i as usize;
+                acc_re[i] = 0.0;
+                acc_im[i] = 0.0;
+                touched[i] = false;
+            }
+            visited.clear();
+            if col % (internal / 10).max(1) == 0 {
+                eprintln!(
+                    "cubel-global: assemble {}% ({} cols, CSC nnz {}, widest column {}, wall {:.3} s)",
+                    100 * col / internal,
+                    col,
+                    row_idx.len(),
+                    peak_col,
+                    wall.elapsed().as_secs_f64(),
+                );
+            }
         }
         eprintln!(
-            "cubel-global: gathered {} contributions -> CSC nnz {} (wall {:.3} s)",
-            coo.len(),
+            "cubel-global: CSC complete: nnz {} (widest column {}, wall {:.3} s)",
             row_idx.len(),
+            peak_col,
             wall.elapsed().as_secs_f64(),
         );
 
