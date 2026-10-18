@@ -22,7 +22,8 @@
 //!   is real);
 //! * `Z_ee⁻¹ · Z_ep` is solved column by column — one restarted
 //!   [GMRES](crate::gmres) solve per port — with a Jacobi (diagonal)
-//!   preconditioner;
+//!   preconditioner; set `FASTERHENRY_PRECOND=none` to run the same
+//!   solves unpreconditioned (iteration-floor diagnostics);
 //! * the port columns `Z_ep` and the block `Z_pp` need one pFFT product per
 //!   port, done once at assembly, since `R` and `L` are frequency
 //!   independent.
@@ -450,6 +451,18 @@ where
     if internal == 0 {
         return Ok((pp.clone(), Vec::new()));
     }
+    // Diagnostics knob: `FASTERHENRY_PRECOND=none` swaps the Jacobi
+    // preconditioner for the identity — right-preconditioning with M = I is
+    // plain GMRES on the same operator, i.e. the unpreconditioned iteration
+    // floor for the very system the preconditioner normally shields.
+    let identity_precond: Vec<T>;
+    let diagonal: &[T] =
+        if std::env::var_os("FASTERHENRY_PRECOND").is_some_and(|v| v == *"none") {
+            identity_precond = vec![T::from_real(1.0); internal];
+            &identity_precond
+        } else {
+            diagonal
+        };
     let mut solved = DMatrix::zeros(internal, ep.ncols());
     let mut outcomes = Vec::with_capacity(ep.ncols());
     for port in 0..ep.ncols() {
