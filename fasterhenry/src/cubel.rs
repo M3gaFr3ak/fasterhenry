@@ -495,23 +495,33 @@ fn near_pair_data(
 ) -> Result<NearPairData, KernelError> {
     let branches = filaments.len();
     let pairs = near_pairs(filaments, near_radius);
-    let mut partners: Vec<Vec<(u32, f64)>> = vec![Vec::new(); branches];
-    for a in 0..branches {
-        let direction = filaments[a].direction();
-        for &j in &pairs[a] {
-            let j = j as usize;
-            if j <= a {
-                continue;
+    // Kernel evaluations dominate this stage at 80k+ branches; the pair
+    // list per branch is independent, so rayon over branch indices
+    // preserves the exact kernel set (each pair computed once, upper
+    // side only).
+    let partner_results: Vec<Result<Vec<(u32, f64)>, KernelError>> = (0..branches)
+        .into_par_iter()
+        .map(|a| {
+            let direction = filaments[a].direction();
+            let mut list: Vec<(u32, f64)> = Vec::new();
+            for &j in &pairs[a] {
+                let j = j as usize;
+                if j <= a {
+                    continue;
+                }
+                if direction.dot(&filaments[j].direction()).abs() < ORTHOGONAL_COS {
+                    continue;
+                }
+                let m = mutual_inductance(&filaments[a], &filaments[j])?;
+                list.push((j as u32, m));
             }
-            if direction.dot(&filaments[j].direction()).abs() < ORTHOGONAL_COS {
-                continue;
-            }
-            let m = mutual_inductance(&filaments[a], &filaments[j])?;
-            partners[a].push((j as u32, m));
-        }
-    }
-    for list in &mut partners {
-        list.sort_by_key(|&(p, _)| p);
+            list.sort_by_key(|&(p, _)| p);
+            Ok(list)
+        })
+        .collect();
+    let mut partners: Vec<Vec<(u32, f64)>> = Vec::with_capacity(branches);
+    for result in partner_results {
+        partners.push(result?);
     }
     // Mirror the upper triangle into both directions so a column scan
     // sees every partner of its branches without an adjacency transpose
@@ -593,86 +603,133 @@ impl CubelGlobal {
             near_radius,
         );
 
-        // Column-keyed assembly over a per-column dense accumulator.
-        // These decks' mesh rows carry ~100+ branches, so the branch-pair
-        // -> row-pair expansion of M Z M^T is a ~30:1 duplicate multiset;
-        // the earlier sort-then-merge over a materialized (col, row)
-        // multiset reached 2.2e9 entries = an OOM before the merge could
-        // run. The accumulator merges duplicates during the sweep, so
-        // peak memory is the CSC result plus O(n) scratch.
-        let mut col_ptr: Vec<u32> = vec![0; internal + 1];
+        // Column-keyed assembly over per-column dense accumulators,
+        // rayon-chunked: columns are disjoint and independent, each
+        // chunk runs its own accumulator + touched list and flushes a
+        // chunk-local CSC segment; segments concatenate in order, so the
+        // result is bit-identical to the serial sweep. These decks' mesh
+        // rows carry ~100+ branches, so the branch-pair -> row-pair
+        // expansion of M Z M^T is a ~30:1 duplicate multiset; the first
+        // paint (materialized multiset, sort-then-merge) reached 2.2e9
+        // entries = an OOM before any merge could run. The accumulator
+        // merges duplicates during the sweep, so peak memory is the CSC
+        // result plus O(n) scratch per worker.
+        #[derive(Default)]
+        struct ChunkOut {
+            col_ptr: Vec<u32>,
+            row_idx: Vec<u32>,
+            re_part: Vec<f64>,
+            im_part: Vec<f64>,
+            peak_col: usize,
+        }
+        let threads = rayon::current_num_threads().max(1);
+        let chunk_len = internal.div_ceil((threads * 4).max(1)).max(1);
+        let chunk_bounds: Vec<(usize, usize)> = (0..internal)
+            .step_by(chunk_len)
+            .map(|lo| (lo, (lo + chunk_len).min(internal)))
+            .collect();
+        let chunk_count = chunk_bounds.len();
+        eprintln!("cubel-global: assembling {chunk_count} chunks over {threads} threads");
+        let progress = std::sync::atomic::AtomicUsize::new(0);
+        let printed = std::sync::atomic::AtomicUsize::new(1);
+        let chunks: Vec<ChunkOut> = chunk_bounds
+            .into_par_iter()
+            .map(|(lo, hi)| {
+                let mut out = ChunkOut::default();
+                let mut col_ptr = vec![0u32; hi - lo + 1];
+                let mut acc_re = vec![0.0f64; internal];
+                let mut acc_im = vec![0.0f64; internal];
+                let mut touched = vec![false; internal];
+                let mut visited: Vec<u32> = Vec::new();
+                for col in lo..hi {
+                    for &(a, sign_a) in mesh.row(col) {
+                        // Shared branch `a`: the resistance half
+                        // (omega-free, diagonal in branch space) and the
+                        // self inductance; every row containing `a`
+                        // couples through it.
+                        let re_a = *resistances.get(a).unwrap_or(&0.0);
+                        let l_self = pattern.self_l[a];
+                        for inc in &pattern.branch_rows[a] {
+                            let i = inc.row as usize;
+                            let prod = sign_a * inc.sign;
+                            if !touched[i] {
+                                touched[i] = true;
+                                visited.push(i as u32);
+                            }
+                            acc_re[i] += prod * re_a;
+                            acc_im[i] += prod * l_self;
+                        }
+                        // Near partners in both directions
+                        // (upper-triangle exact mutuals, mirrored): pure
+                        // inductance, the omega scale joins at factor
+                        // time.
+                        for &(other, l) in &pattern.partner_all[a] {
+                            for inc in &pattern.branch_rows[other as usize] {
+                                let i = inc.row as usize;
+                                let prod = sign_a * inc.sign;
+                                if !touched[i] {
+                                    touched[i] = true;
+                                    visited.push(i as u32);
+                                }
+                                acc_im[i] += prod * l;
+                            }
+                        }
+                    }
+                    if visited.is_empty() {
+                        col_ptr[col - lo + 1] = out.row_idx.len() as u32;
+                        continue;
+                    }
+                    // CSC wants ascending rows per column; `visited`
+                    // collects in incidence order.
+                    visited.sort_unstable();
+                    for &i in &visited {
+                        out.row_idx.push(i);
+                        out.re_part.push(acc_re[i as usize]);
+                        out.im_part.push(acc_im[i as usize]);
+                    }
+                    col_ptr[col - lo + 1] = out.row_idx.len() as u32;
+                    out.peak_col = out.peak_col.max(visited.len());
+                    for &i in &visited {
+                        let i = i as usize;
+                        acc_re[i] = 0.0;
+                        acc_im[i] = 0.0;
+                        touched[i] = false;
+                    }
+                    visited.clear();
+                }
+                out.col_ptr = col_ptr;
+                // Progress: one line per decile of chunks.
+                let done = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let percent = 100 * done / chunk_count;
+                let prev = printed.fetch_max(percent, std::sync::atomic::Ordering::Relaxed);
+                if prev < percent {
+                    eprintln!("cubel-global: assemble {}% ({} chunks done)", percent, done,);
+                }
+                out
+            })
+            .collect();
+        // Stitch: chunk k covers columns [lo, hi); its col_ptr is local
+        // (col_ptr[0] = 0, offsets relative), so the global value is
+        // base + local.
+        let mut col_ptr: Vec<u32> = Vec::with_capacity(internal + 1);
+        col_ptr.push(0);
         let mut row_idx: Vec<u32> = Vec::new();
         let mut re_part: Vec<f64> = Vec::new();
         let mut im_part: Vec<f64> = Vec::new();
-        let mut acc_re = vec![0.0f64; internal];
-        let mut acc_im = vec![0.0f64; internal];
-        let mut touched = vec![false; internal];
-        let mut visited: Vec<u32> = Vec::new();
         let mut peak_col = 0usize;
-        for col in 0..internal {
-            for &(a, sign_a) in mesh.row(col) {
-                // Shared branch `a`: the resistance half (omega-free,
-                // diagonal in branch space) and the self inductance; every
-                // row containing `a` couples through it.
-                let re_a = *resistances.get(a).unwrap_or(&0.0);
-                let l_self = pattern.self_l[a];
-                for inc in &pattern.branch_rows[a] {
-                    let i = inc.row as usize;
-                    let prod = sign_a * inc.sign;
-                    if !touched[i] {
-                        touched[i] = true;
-                        visited.push(i as u32);
-                    }
-                    acc_re[i] += prod * re_a;
-                    acc_im[i] += prod * l_self;
-                }
-                // Near partners in both directions (upper-triangle exact
-                // mutuals, mirrored): pure inductance, the omega scale
-                // joins at factor time.
-                for &(other, l) in &pattern.partner_all[a] {
-                    for inc in &pattern.branch_rows[other as usize] {
-                        let i = inc.row as usize;
-                        let prod = sign_a * inc.sign;
-                        if !touched[i] {
-                            touched[i] = true;
-                            visited.push(i as u32);
-                        }
-                        acc_im[i] += prod * l;
-                    }
-                }
+        for chunk in chunks {
+            let base = row_idx.len() as u32;
+            // The chunk's col_ptr[0] is its local start sentinel; the
+            // global array only needs the column ends.
+            for &offset in chunk.col_ptr.iter().skip(1) {
+                col_ptr.push(base + offset);
             }
-            if visited.is_empty() {
-                col_ptr[col + 1] = row_idx.len() as u32;
-                continue;
-            }
-            // CSC wants ascending rows per column; `visited` collects in
-            // incidence order.
-            visited.sort_unstable();
-            for &i in &visited {
-                row_idx.push(i);
-                re_part.push(acc_re[i as usize]);
-                im_part.push(acc_im[i as usize]);
-            }
-            col_ptr[col + 1] = row_idx.len() as u32;
-            peak_col = peak_col.max(visited.len());
-            for &i in &visited {
-                let i = i as usize;
-                acc_re[i] = 0.0;
-                acc_im[i] = 0.0;
-                touched[i] = false;
-            }
-            visited.clear();
-            if col % (internal / 10).max(1) == 0 {
-                eprintln!(
-                    "cubel-global: assemble {}% ({} cols, CSC nnz {}, widest column {}, wall {:.3} s)",
-                    100 * col / internal,
-                    col,
-                    row_idx.len(),
-                    peak_col,
-                    wall.elapsed().as_secs_f64(),
-                );
-            }
+            row_idx.extend_from_slice(&chunk.row_idx);
+            re_part.extend_from_slice(&chunk.re_part);
+            im_part.extend_from_slice(&chunk.im_part);
+            peak_col = peak_col.max(chunk.peak_col);
         }
+        debug_assert_eq!(col_ptr.len(), internal + 1);
         eprintln!(
             "cubel-global: CSC complete: nnz {} (widest column {}, wall {:.3} s)",
             row_idx.len(),
