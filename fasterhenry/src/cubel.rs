@@ -616,9 +616,13 @@ impl CubelGlobal {
             wall.elapsed().as_secs_f64(),
         );
         eprintln!(
-            "cubel-global: pattern: {internal} rows, {} branches, radius {:.3e} m",
+            "cubel-global: pattern: {internal} rows, {} branches, radius {:.3e} m (mult {:.3})",
             filaments.len(),
             near_radius,
+            std::env::var("FASTERHENRY_CUBEL_RADIUS_MULT")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(1.0),
         );
 
         // Column-keyed assembly over per-column dense accumulators,

@@ -525,15 +525,31 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
     }
 
     /// Builds the global (D-4 letter) state at `omega`.
+    ///
+    /// The pattern radius is independently tunable via
+    /// `FASTERHENRY_CUBEL_RADIUS_MULT` (default 1.0): it scales only the
+    /// preconditioner's near-pattern, never the operator's precorrect
+    /// radius or the pFFT grid, so `A` is unchanged and the knob trades
+    /// memory (pattern CSC + LU fill, ~r^2 scaling) for iterations.
     fn cubel_global(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError>
     where
         T: crate::cubel::FieldParts,
     {
+        let radius_mult: f64 = std::env::var("FASTERHENRY_CUBEL_RADIUS_MULT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1.0);
+        if !(0.0..=f64::INFINITY).contains(&radius_mult) || radius_mult <= 0.0 {
+            eprintln!(
+                "cubel-global: warning: FASTERHENRY_CUBEL_RADIUS_MULT={radius_mult} invalid; using 1.0"
+            );
+        }
+        let radius_mult = if radius_mult > 0.0 { radius_mult } else { 1.0 };
         let global = CubelGlobal::build(
             &system.mesh,
             &system.filaments,
             &system.resistances,
-            system.operator.near_radius(),
+            system.operator.near_radius() * radius_mult,
         )
         .map_err(SolveError::from)?;
         let factors = global.factor::<T>(omega);
