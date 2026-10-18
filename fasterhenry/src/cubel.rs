@@ -433,6 +433,24 @@ fn partition_state(
     }
 }
 
+/// Peak RSS bookkeeping for the build/factor instrumentation: reads the
+/// kernel's high-water mark so each stage print carries the memory up
+/// to that point (deltas between prints = stage peaks).
+fn hwm_mib() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let kb: usize = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            return kb / 1024;
+        }
+    }
+    0
+}
+
 /// D-4's letter, built on the scout's gather: *every* near pair
 /// (cross-cube included) plus every shared-branch term as ONE sparse
 /// mesh-space matrix `S(omega) = M (R + i omega L_near) M^T`, factorised
@@ -731,10 +749,11 @@ impl CubelGlobal {
         }
         debug_assert_eq!(col_ptr.len(), internal + 1);
         eprintln!(
-            "cubel-global: CSC complete: nnz {} (widest column {}, wall {:.3} s)",
+            "cubel-global: CSC complete: nnz {} (widest column {}, wall {:.3} s, hwm {} MiB)",
             row_idx.len(),
             peak_col,
             wall.elapsed().as_secs_f64(),
+            hwm_mib(),
         );
 
         // Symbolic LU; COLAMD ordering happens inside faer.
@@ -748,8 +767,13 @@ impl CubelGlobal {
         let symbolic = SymbolicLu::try_new(sym.as_ref()).ok();
         if symbolic.is_none() {
             eprintln!("cubel-global: warning: symbolic LU build failed; identity fallback");
+        } else {
+            eprintln!(
+                "cubel-global: symbolic LU ready (n = {internal}, wall {:.3} s, hwm {} MiB)",
+                wall.elapsed().as_secs_f64(),
+                hwm_mib(),
+            );
         }
-        eprintln!("cubel-global: symbolic LU ready (n = {internal})");
 
         Ok(Self {
             n: internal,
@@ -793,16 +817,18 @@ impl CubelGlobal {
         match Lu::try_new_with_symbolic(symbolic.clone(), mat) {
             Ok(factors) => {
                 eprintln!(
-                    "cubel-global: factored S(omega={:.3e}), wall {:.3} s",
+                    "cubel-global: factored S(omega={:.3e}), wall {:.3} s, hwm {} MiB",
                     omega,
                     wall.elapsed().as_secs_f64(),
+                    hwm_mib(),
                 );
                 Some(factors)
             }
             Err(_) => {
                 if !FALLBACK_SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
-                        "cubel-global: warning: numeric factorization failed; identity fallback"
+                        "cubel-global: warning: numeric factorization failed (hwm {} MiB); identity fallback",
+                        hwm_mib(),
                     );
                 }
                 None
