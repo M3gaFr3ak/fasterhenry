@@ -27,7 +27,12 @@ fn main() -> anyhow::Result<()> {
     } = invocation.into_args();
 
     let options = ParseOptions { fasthenry_compat };
+    let wall = std::time::Instant::now();
     let problem = read_inputs_with(&input, options).map_err(|m| anyhow::anyhow!("{m}"))?;
+    eprintln!(
+        "load: deck problem built, wall {:.1} s at this point",
+        wall.elapsed().as_secs_f64()
+    );
     let override_frequencies = match &freq {
         Some(values) => Some(decade_frequencies(values[0], values[1], values[2])?),
         None => None,
@@ -41,6 +46,10 @@ fn main() -> anyhow::Result<()> {
     {
         eprintln!("solver: iterative (matrix-free precorrected-FFT + GMRES)");
     }
+    eprintln!(
+        "load: solve dispatch reached, wall {:.1} s at this point",
+        wall.elapsed().as_secs_f64()
+    );
     let (result, warnings) = run_reporting_with(&problem, override_frequencies, choice)
         .map_err(|m| anyhow::anyhow!("{m}"))?;
     // Truncation is a physical approximation; say so on stderr, so it

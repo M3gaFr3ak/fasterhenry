@@ -32,9 +32,20 @@ pub fn read_inputs_with(path: &Path, options: inp::ParseOptions) -> Result<Probl
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some("inp") | Some("fh") => inp::parse_with_options(&text, options)
-            .map(Problem::from)
-            .map_err(|error| error.to_string()),
+        Some("inp") | Some("fh") => {
+            let wall = std::time::Instant::now();
+            let deck = inp::parse_with_options(&text, options).map_err(|e| e.to_string())?;
+            eprintln!(
+                "deck: parse complete, wall {:.1} s",
+                wall.elapsed().as_secs_f64()
+            );
+            let problem = Problem::from(deck);
+            eprintln!(
+                "deck: problem built, wall {:.1} s",
+                wall.elapsed().as_secs_f64()
+            );
+            Ok(problem)
+        }
         _ => serde_json::from_str(&text)
             .map_err(|error| format!("invalid problem document: {error}")),
     }

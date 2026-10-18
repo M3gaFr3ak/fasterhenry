@@ -2601,10 +2601,22 @@ pub fn parse_with_options(text: &str, options: ParseOptions) -> Result<Deck, Par
         title: folded.title,
         ..DeckBuilder::default()
     };
+    let parse_wall = std::time::Instant::now();
     for &(number, ref tokens) in &folded.lines {
         deck.apply_line(number, tokens)?;
+        if number % 500_000 == 0 {
+            eprintln!(
+                "deck: applied through line {number}, wall {:.1} s",
+                parse_wall.elapsed().as_secs_f64()
+            );
+        }
     }
-    deck.finish(folded.last_number)
+    let parsed = deck.finish(folded.last_number)?;
+    eprintln!(
+        "deck: finish done (nodes/segments grouped), wall {:.1} s",
+        parse_wall.elapsed().as_secs_f64()
+    );
+    Ok(parsed)
 }
 
 /// A deck's lines ready for dispatch: `*` comments and blank lines dropped,
@@ -3357,6 +3369,7 @@ impl DeckBuilder {
     /// `last_number` is [`FoldedDeck::last_number`] — the line a missing
     /// `.end` or `.units` is reported on.
     fn finish(self, last_number: usize) -> Result<Deck, ParseError> {
+        let parse_wall = std::time::Instant::now();
         self.check_complete(last_number)?;
         let DeckBuilder {
             title,
@@ -3382,6 +3395,10 @@ impl DeckBuilder {
         // reference declared *before* the .equiv directive lands on the
         // canonical node too — the deck is one circuit, not a timeline.
         let compaction = names.compaction(positions.len());
+        eprintln!(
+            "deck: finish: equiv compaction done, wall {:.1} s",
+            parse_wall.elapsed().as_secs_f64()
+        );
         let resolve = |slot: usize| -> usize {
             let mut id = slot;
             while let Some(&target) = names.aliases.get(&id) {
@@ -3409,6 +3426,16 @@ impl DeckBuilder {
         // snap to the nearest live cell node. Plane ids are final here; the
         // declared nodes that are still referenced as themselves get their ids
         // below (a snapped endpoint's declared node is dropped, not orphaned).
+        let live_positions: Vec<[f64; 3]> = {
+            let live_count = compaction.iter().filter(|slot| slot.is_some()).count();
+            let mut live = vec![[0.0_f64; 3]; live_count];
+            for (slot, &position) in positions.iter().enumerate() {
+                if let Some(index) = compaction[slot] {
+                    live[index] = position;
+                }
+            }
+            live
+        };
         let snap = |slot: usize| -> Result<Option<usize>, ParseError> {
             let live = resolve(slot);
             if let Some(&node) = plane_node_at.get(&live) {
@@ -3429,7 +3456,7 @@ impl DeckBuilder {
                         .0,
                 ));
             }
-            let position = live_position(live, &positions, &compaction);
+            let position = live_positions[live];
             for (spec, centres) in &plane_meshes {
                 if spec.plane.contains(position, 0.0) {
                     return Ok(Some(
@@ -3456,6 +3483,11 @@ impl DeckBuilder {
             .iter()
             .map(|spec| Ok((endpoint(spec.a)?, endpoint(spec.b)?, spec)))
             .collect::<Result<_, ParseError>>()?;
+        eprintln!(
+            "deck: finish: segment endpoints resolved ({} segments), wall {:.1} s",
+            segment_defs.len(),
+            parse_wall.elapsed().as_secs_f64()
+        );
         let port_ends: Vec<(End, End)> = ports
             .iter()
             .map(|port| Ok((endpoint(port.positive.0)?, endpoint(port.negative.0)?)))
@@ -3495,6 +3527,10 @@ impl DeckBuilder {
             next_id += 1;
         }
 
+        eprintln!(
+            "deck: finish: geometry nodes added, wall {:.1} s",
+            parse_wall.elapsed().as_secs_f64()
+        );
         let final_id = |endpoint: &(Option<usize>, usize)| -> usize {
             endpoint.0.unwrap_or(live_to_id[endpoint.1])
         };
@@ -3519,6 +3555,10 @@ impl DeckBuilder {
             port.positive = NodeId(final_id(positive));
             port.negative = NodeId(final_id(negative));
         }
+        eprintln!(
+            "deck: finish: segments added, wall {:.1} s",
+            parse_wall.elapsed().as_secs_f64()
+        );
 
         let discretization = discretization_of(plane_subdivisions, subdivisions);
 
@@ -3717,20 +3757,10 @@ fn truncated_coupling(
     Ok(coupling)
 }
 
-/// The position of the `live`-th surviving slot (the index space `resolve`
-/// produces: aliased-away slots are compacted out, survivors keep order).
-fn live_position(live: usize, positions: &[[f64; 3]], compaction: &[Option<usize>]) -> [f64; 3] {
-    let mut seen = 0usize;
-    for (slot, mapped) in compaction.iter().enumerate() {
-        if mapped.is_some() {
-            if seen == live {
-                return positions[slot];
-            }
-            seen += 1;
-        }
-    }
-    unreachable!("compaction guarantees a live slot for every resolved id")
-}
+/// Sourced from `finish`, which prebuilds the per-live-slot position table
+/// (`live_positions`) in O(nodes) once — this function's per-endpoint
+/// rescan of the compaction array made 2 M-node decks quadratically slow
+/// (5 M endpoints x 2 M slots); removed rather than re-tuned.
 
 /// The `.freq` decade sweep; see the module documentation. Integer decades
 /// use exact `powi` so round decimal frequencies round-trip bitwise.
