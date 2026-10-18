@@ -151,7 +151,7 @@
 
 mod fft;
 mod grid;
-mod near;
+pub(crate) mod near;
 
 use nalgebra::Vector3;
 use rayon::prelude::*;
@@ -313,6 +313,10 @@ pub struct PfftOperator {
     components: Vec<usize>,
     near: NearField,
     convolver: Option<Convolver>,
+    /// Near-field pairing radius in metres (`near_field_radius` grid cells
+    /// times the grid spacing), so downstream set-up (the CUBEL pattern)
+    /// can reuse the operator's own pairing.
+    near_radius: f64,
 }
 
 impl PfftOperator {
@@ -445,6 +449,7 @@ impl PfftOperator {
             components,
             near,
             convolver: Some(convolver),
+            near_radius: radius,
         })
     }
 
@@ -465,7 +470,14 @@ impl PfftOperator {
                 ..NearField::default()
             },
             convolver: None,
+            near_radius: 0.0,
         }
+    }
+
+    /// The near-field pairing radius in metres (`near_field_radius` grid
+    /// cells times the operator's own grid spacing).
+    pub fn near_radius(&self) -> f64 {
+        self.near_radius
     }
 
     /// Number of filaments, the dimension of `L`.

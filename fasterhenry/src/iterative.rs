@@ -70,10 +70,12 @@
 
 use std::time::Instant;
 
-use nalgebra::{ComplexField, DMatrix};
+use faer::traits::ComplexField as FaerComplexField;
+use nalgebra::{ComplexField, DMatrix, Dyn, LU};
 use num_complex::Complex;
 use rayon::prelude::*;
 
+use crate::cubel::{CubelGlobal, CubelParams, CubelPattern, AVER_ROWS};
 use crate::filament::Filament;
 use crate::geometry::Geometry;
 use crate::gmres::{gmres, GmresOutcome, GmresParams};
@@ -287,12 +289,19 @@ impl IterativeSystem {
     /// As [`impedance`](Self::impedance).
     pub fn solve(&self, frequency: f64) -> Result<IterativeSolution, SolveError> {
         check_frequency(0, frequency)?;
+        let kind = PrecondKind::from_env();
         let (z, outcomes) = if frequency == 0.0 {
+            let precond = match kind {
+                PrecondKind::Cubel => Precond::cubel(self, 0.0)?,
+                PrecondKind::CubelGlobal => Precond::cubel_global(self, 0.0)?,
+                PrecondKind::None => Precond::Identity,
+                PrecondKind::Jacobi => Precond::Jacobi(self.r_diag.clone()),
+            };
             let (z, outcomes) = schur_complement_gmres(
                 &self.r_ep,
                 &self.r_pp,
                 |x| self.apply_dc(x),
-                &self.r_diag,
+                &precond,
                 &self.gmres,
                 frequency,
             )?;
@@ -307,11 +316,17 @@ impl IterativeSystem {
                 .zip(&self.l_diag)
                 .map(|(&r, &l)| C64::new(r, omega * l))
                 .collect();
+            let precond = match kind {
+                PrecondKind::Cubel => Precond::cubel(self, omega)?,
+                PrecondKind::CubelGlobal => Precond::cubel_global(self, omega)?,
+                PrecondKind::None => Precond::Identity,
+                PrecondKind::Jacobi => Precond::Jacobi(diagonal),
+            };
             schur_complement_gmres(
                 &complex(&self.r_ep, &self.l_ep),
                 &complex(&self.r_pp, &self.l_pp),
                 |x| self.apply_ac(omega, x),
-                &diagonal,
+                &precond,
                 &self.gmres,
                 frequency,
             )?
@@ -436,45 +451,131 @@ impl IterativeSystem {
 /// `pp − epᵀ · ee⁻¹ · ep` with `ee⁻¹` applied by one Jacobi-preconditioned
 /// GMRES solve per column of `ep`. The transpose is plain, not conjugated:
 /// the mesh impedance matrix is complex symmetric.
+/// Which preconditioner the knob selects. Read once per solve, never
+/// per-iteration, and treated as transient runtime state (not recorded
+/// anywhere in results beyond the solve's own logs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrecondKind {
+    /// Default: the Jacobi diagonal.
+    Jacobi,
+    /// M = I: plain GMRES on the same operator, the unpreconditioned
+    /// iteration floor (`FASTERHENRY_PRECOND=none`).
+    None,
+    /// The CUBEL mesh-block prototype (`FASTERHENRY_PRECOND=cubel`).
+    Cubel,
+    /// The D-4 letter: one global near-pattern matrix factored by faer's
+    /// sparse LU (`FASTERHENRY_PRECOND=cubel-global`).
+    CubelGlobal,
+}
+
+impl PrecondKind {
+    fn from_env() -> Self {
+        match std::env::var("FASTERHENRY_PRECOND").as_deref() {
+            Ok("none") => PrecondKind::None,
+            Ok("cubel") => PrecondKind::Cubel,
+            Ok("cubel-global") => PrecondKind::CubelGlobal,
+            _ => PrecondKind::Jacobi,
+        }
+    }
+}
+
+/// The preconditioner of the internal (loop-space) block system, built once
+/// per frequency.
+enum Precond<T: ComplexField<RealField = f64> + Copy> {
+    Jacobi(Vec<T>),
+    /// Right-preconditioning with M = I: plain GMRES on the same operator,
+    /// i.e. the unpreconditioned iteration floor.
+    Identity,
+    Cubel(Box<CubelState<T>>),
+    CubelGlobal(Box<CubelGlobalState<T>>),
+}
+
+/// The built cube preconditioner: the omega-independent pattern plus this
+/// frequency's per-cube factorisations.
+struct CubelState<T: ComplexField<RealField = f64> + Copy> {
+    pattern: CubelPattern,
+    factors: Vec<LU<T, Dyn, Dyn>>,
+}
+
+/// The built global preconditioner: the omega-independent CSC pattern with
+/// its COLAMD symbolic factorization, plus this frequency's numeric LU
+/// (`None` after a failed factorization: the apply falls back to the
+/// identity, with a one-shot warning from the builder).
+struct CubelGlobalState<T: ComplexField<RealField = f64> + Copy> {
+    global: CubelGlobal,
+    factors: Option<faer::sparse::linalg::solvers::Lu<u32, T>>,
+}
+
+impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> Precond<T> {
+    /// Builds the CUBEL state at `omega` from the system's own pieces.
+    fn cubel(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError>
+    where
+        T: crate::cubel::FieldParts,
+    {
+        let pattern = CubelPattern::build(
+            &system.mesh,
+            &system.filaments,
+            CubelParams {
+                max_block_rows: AVER_ROWS,
+                near_radius: system.operator.near_radius(),
+            },
+        )?;
+        let factors = pattern.factor_blocks::<T>(&system.mesh, &system.resistances, omega);
+        Ok(Self::Cubel(Box::new(CubelState { pattern, factors })))
+    }
+
+    /// Builds the global (D-4 letter) state at `omega`.
+    fn cubel_global(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError>
+    where
+        T: crate::cubel::FieldParts,
+    {
+        let global = CubelGlobal::build(
+            &system.mesh,
+            &system.filaments,
+            &system.resistances,
+            system.operator.near_radius(),
+        )
+        .map_err(SolveError::from)?;
+        let factors = global.factor::<T>(omega);
+        Ok(Self::CubelGlobal(Box::new(CubelGlobalState {
+            global,
+            factors,
+        })))
+    }
+
+    fn run(&self, v: &[T]) -> Vec<T> {
+        match self {
+            Self::Jacobi(d) => v.iter().zip(d.iter()).map(|(&v, &d)| v / d).collect(),
+            Self::Identity => v.to_vec(),
+            Self::Cubel(state) => state.pattern.apply_blocks(&state.factors, v),
+            Self::CubelGlobal(state) => {
+                CubelGlobal::apply_global(state.factors.as_ref(), state.global.n(), v)
+            }
+        }
+    }
+}
+
 fn schur_complement_gmres<T>(
     ep: &DMatrix<T>,
     pp: &DMatrix<T>,
     apply_ee: impl Fn(&[T]) -> Vec<T>,
-    diagonal: &[T],
+    precond: &Precond<T>,
     params: &GmresParams,
     frequency: f64,
 ) -> Result<(DMatrix<T>, Vec<GmresOutcome>), SolveError>
 where
-    T: ComplexField<RealField = f64> + Copy,
+    T: ComplexField<RealField = f64> + Copy + Sync + Send + FaerComplexField,
 {
     let internal = ep.nrows();
     if internal == 0 {
         return Ok((pp.clone(), Vec::new()));
     }
-    // Diagnostics knob: `FASTERHENRY_PRECOND=none` swaps the Jacobi
-    // preconditioner for the identity — right-preconditioning with M = I is
-    // plain GMRES on the same operator, i.e. the unpreconditioned iteration
-    // floor for the very system the preconditioner normally shields.
-    let identity_precond: Vec<T>;
-    let diagonal: &[T] =
-        if std::env::var_os("FASTERHENRY_PRECOND").is_some_and(|v| v == *"none") {
-            identity_precond = vec![T::from_real(1.0); internal];
-            &identity_precond
-        } else {
-            diagonal
-        };
     let mut solved = DMatrix::zeros(internal, ep.ncols());
     let mut outcomes = Vec::with_capacity(ep.ncols());
     for port in 0..ep.ncols() {
         let rhs: Vec<T> = ep.column(port).iter().copied().collect();
         let mut x = vec![T::zero(); internal];
-        let outcome = gmres(
-            &apply_ee,
-            |v: &[T]| v.iter().zip(diagonal).map(|(&v, &d)| v / d).collect(),
-            &rhs,
-            &mut x,
-            params,
-        );
+        let outcome = gmres(&apply_ee, |v: &[T]| precond.run(v), &rhs, &mut x, params);
         if !outcome.converged {
             return Err(SolveError::NotConverged {
                 frequency,
