@@ -18,6 +18,16 @@
 //! branch-pair row expansion, rayon chunked flushes); the only change
 //! is the per-entry layer routing. It never touches the working
 //! `cubel-global` path.
+//!
+//! **LEGACY / DEPRECATED (user-locked 2026-10-19; kept, never
+//! overwritten):** the two-sweep block-GS apply freezes on cross-heavy
+//! patterns (MPPT arm-7 row: |r| flat at 0.854 for 250+ iterations
+//! once cross nnz is 44% of the pattern; the same pattern inverted
+//! exactly converges in 258 - see `spike/hmat/NOTES.md` 2026-10-19),
+//! and on pour-heavy decks the per-layer blocks are unfit at any
+//! conditioning radius. Kept selectable (`FASTERHENRY_PRECOND=
+//! two-level`) as the weak-cross fallback and as the layer-split
+//! chassis (tagging/permutation/routing) future engines reuse.
 
 use crate::cubel::{hwm_mib, near_pair_data, FieldParts};
 use crate::filament::Filament;

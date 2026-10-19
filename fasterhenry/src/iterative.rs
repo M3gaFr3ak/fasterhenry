@@ -475,6 +475,9 @@ enum PrecondKind {
     /// copper layer into per-layer blocks plus a cross-layer CSR
     /// applied in a two-sweep block Gauss-Seidel
     /// (`FASTERHENRY_PRECOND=two-level`).
+    /// LEGACY / DEPRECATED (2026-10-19): kept selectable but frozen-
+    /// prone on cross-heavy patterns (see `crate::twolevel` module
+    /// docs). New engines must land as NEW kinds, never reuse this.
     TwoLevel,
 }
 
