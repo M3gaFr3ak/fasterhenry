@@ -268,6 +268,39 @@ mod tests {
     const C: f64 = 2.0;
 
     #[test]
+    fn structurally_zero_kernel_inverts_to_zero_without_nan() {
+        // A structurally zero kernel (cross-axis families, cross-layer
+        // at DC) has no spectral energy to invert: the naive Wiener
+        // formula is 0/0 = NaN per band, and NaN spreads silently
+        // through f64::max. The guard must produce an all-zero
+        // inverse with no epsilon floor, a kernel_hat that stays
+        // zero, and an apply that leaves finite-time zeros - pins the
+        // 2026-10-20 summary's guard directly (audit F1).
+        let n = 5;
+        let cell = 0.1;
+        let kernel = ConvKernel::build_complex(n, cell, |_, _| Complex64::new(0.0, 0.0), 0.01);
+        assert_eq!(kernel.epsilon(), 0.0, "zero-peak takes no eps floor");
+        assert_eq!(
+            kernel.inverse_peak_gain(),
+            0.0,
+            "an all-zero inverse has no gain - and not NaN"
+        );
+        for value in &kernel.kernel_hat {
+            assert_eq!(value.norm(), 0.0, "zero sample raster must stay zero");
+        }
+        let mut field = vec![Complex64::new(3.25, -1.5); n * n];
+        kernel.apply(&mut field);
+        for value in &field {
+            assert!(value.is_finite(), "guard apply must not produce NaN");
+            assert_eq!(
+                value.norm(),
+                0.0,
+                "an all-zero inverse smears nothing: got {value}"
+            );
+        }
+    }
+
+    #[test]
     fn const_kernel_pins_the_normalization() {
         // A constant kernel's spectrum is a single spike at DC with
         // height m0 = C * n^2; applied to an all-ones field the
