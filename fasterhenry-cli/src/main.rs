@@ -90,12 +90,32 @@ fn main() -> anyhow::Result<()> {
             },
             Err(_) => None,
         };
+        let via_bin = match std::env::var("FASTERHENRY_CENSUS_VIA_BIN_M") {
+            Ok(text) => match text.trim().parse::<f64>() {
+                Ok(value) if value.is_finite() && value > 0.0 => Some(value),
+                _ => anyhow::bail!(
+                    "FASTERHENRY_CENSUS_VIA_BIN_M must be a positive finite number of metres, got {text:?}"
+                ),
+            },
+            Err(_) => None,
+        };
+        let via_threshold = match std::env::var("FASTERHENRY_CENSUS_VIA_DENSITY") {
+            Ok(text) => match text.trim().parse::<usize>() {
+                Ok(value) if value > 0 => Some(value),
+                _ => anyhow::bail!(
+                    "FASTERHENRY_CENSUS_VIA_DENSITY must be a positive vias-per-cell count, got {text:?}"
+                ),
+            },
+            Err(_) => None,
+        };
         let started = std::time::Instant::now();
         let census = fasterhenry::census::census_for(
             &problem.geometry,
             &problem.ports,
             &problem.discretization,
             radius,
+            via_bin,
+            via_threshold,
         )
         .map_err(|error| anyhow::anyhow!("{error}"))?;
         eprintln!(
