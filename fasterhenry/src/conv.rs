@@ -1174,10 +1174,12 @@ impl ConvPrecond {
     ///
     /// Tab chassis (2c): `composition` selects the explicit
     /// per-census-patch blocks (`Both` default through the env
-    /// knob); `tab_bin_m` bins the via census (the engine reads
-    /// `FASTERHENRY_CENSUS_VIA_BIN_M` or falls back to
-    /// `derived_radius`); `tab_pour` adds each patch's landing pours
-    /// (`FASTERHENRY_CONV_TAB_POUR=1` default).
+    /// knob); `tab_bin_m` bins the via census (the bin chain mirrors
+    /// the census CLI's `census_for` fallback exactly:
+    /// `FASTERHENRY_CENSUS_VIA_BIN_M`, then
+    /// `FASTERHENRY_CENSUS_RADIUS_M`, then `census::derived_radius`
+    /// - F3 doc fold 2026-10-20); `tab_pour` adds each patch's
+    /// landing pours (`FASTERHENRY_CONV_TAB_POUR=1` default).
     pub fn build(
         filaments: &[Filament],
         resistances: &[f64],

@@ -629,8 +629,10 @@ impl ConvCore {
             .max(1);
         // Tab chassis (2c): FASTERHENRY_CONV_TABS=both|matvec|off
         // (default both), FASTERHENRY_CONV_TAB_POUR=0|1 (default 1),
-        // via-census bin FASTERHENRY_CENSUS_VIA_BIN_M or the census's
-        // derived first guess.
+        // via-census bin chain mirrors census_for's fallback exactly
+        // (F3 fold: VIA_BIN_M -> CENSUS_RADIUS_M -> derived_radius).
+        // Unparseable bin values warn (fail-loud parity with the
+        // census CLI's bail) and fall to the next hop.
         let composition = match std::env::var("FASTERHENRY_CONV_TABS")
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
@@ -658,20 +660,28 @@ impl ConvCore {
                 true
             }
         };
-        let tab_bin_m =
-            // The bin chain mirrors the census CLI's `census_for`
-            // fallback exactly (audit fold F3, 2026-10-20): histogram
-            // pitch and tab-membership pitch must not skew apart on
-            // one deck.
-            std::env::var("FASTERHENRY_CENSUS_VIA_BIN_M")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .or_else(|| {
-                    std::env::var("FASTERHENRY_CENSUS_RADIUS_M")
-                        .ok()
-                        .and_then(|v| v.trim().parse().ok())
-                })
-                .unwrap_or_else(|| crate::census::derived_radius(&system.filaments));
+        // The bin chain mirrors the census CLI's `census_for`
+        // fallback exactly (audit fold F3, 2026-10-20): histogram
+        // pitch and tab-membership pitch must not skew apart on
+        // one deck. Unparseable values warn and fall to the next
+        // hop (the census CLI bails; deliberate divergence: a bin
+        // pitch is precond cost, never the answer, so the engine
+        // keeps the solve alive).
+        let parse_env_m = |name: &str| -> Option<f64> {
+            let text = std::env::var(name).ok()?;
+            match text.trim().parse::<f64>() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    eprintln!(
+                        "conv: warning: {name}={text:?} not a number; falling through the bin chain"
+                    );
+                    None
+                }
+            }
+        };
+        let tab_bin_m = parse_env_m("FASTERHENRY_CENSUS_VIA_BIN_M")
+            .or_else(|| parse_env_m("FASTERHENRY_CENSUS_RADIUS_M"))
+            .unwrap_or_else(|| crate::census::derived_radius(&system.filaments));
         let core = ConvPrecond::build(
             &system.filaments,
             &system.resistances,
