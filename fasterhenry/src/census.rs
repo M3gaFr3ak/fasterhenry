@@ -72,22 +72,18 @@ pub struct ThresholdSplit {
     pub conv_branches: usize,
     /// Patches homogenized (conv side).
     pub conv_patches: usize,
-    /// Via branches in conv patches (== `conv_branches` by
-    /// construction; kept for print symmetry with the tabs row).
-    pub conv_patch_branches: usize,
     /// Cells in tab patches.
     pub tab_cells: usize,
     /// Via branches in tab patches.
     pub tab_branches: usize,
     /// Patches staying explicit tabs.
     pub tab_patches: usize,
-    /// Via branches in tab patches (== `tab_branches` by
-    /// construction).
-    pub tab_patch_branches: usize,
 }
 
 /// Result of the via-density census: the per-XY-cell via population
-/// the `FASTERHENRY_CONV_VIA_DENSITY` threshold switch needs. A branch
+/// the `FASTERHENRY_CENSUS_VIA_DENSITY` split needs (the v2 engine's
+/// own `FASTERHENRY_CONV_VIA_DENSITY` knob is a future consumer of
+/// this instrument, not a knob set here). A branch
 /// counts as a via when its current direction is predominantly
 /// z-directed (2.5D decks: only via barrels span layers). O(N),
 /// streamed, no pair scans.
@@ -232,43 +228,6 @@ pub fn via_census(filaments: &[Filament], bin_m: f64, threshold: Option<usize>) 
     let mut patch_of: HashMap<u64, u32> = HashMap::with_capacity(per_cell.len());
     let mut patch_cells: Vec<usize> = Vec::new();
     let mut patch_branches: Vec<usize> = Vec::new();
-    if !per_cell.is_empty() {
-        let mut frontier: Vec<u64> = Vec::new();
-        for &key in per_cell.keys() {
-            if patch_of.contains_key(&key) {
-                continue;
-            }
-            let id = patch_cells.len() as u32;
-            patch_of.insert(key, id);
-            frontier.clear();
-            frontier.push(key);
-            let mut cells = 0usize;
-            let mut branches = 0usize;
-            while let Some(cell) = frontier.pop() {
-                cells += 1;
-                branches += per_cell[&cell];
-                let bx = (cell >> 32) as i32 as i64;
-                let by = (cell as u32 as i32) as i64;
-                let neighbours = [
-                    (((bx + 1) as u64) << 32) | (by as i64 as u64 & 0xffff_ffff),
-                    (((bx - 1) as u64) << 32) | (by as i64 as u64 & 0xffff_ffff),
-                    ((bx as u64) << 32) | ((by + 1) as i64 as u64 & 0xffff_ffff),
-                    ((bx as u64) << 32) | ((by - 1) as i64 as u64 & 0xffff_ffff),
-                ];
-                for neighbour in neighbours {
-                    if per_cell.contains_key(&neighbour) && !patch_of.contains_key(&neighbour) {
-                        patch_of.insert(neighbour, id);
-                        frontier.push(neighbour);
-                    }
-                }
-            }
-            patch_cells.push(cells);
-            patch_branches.push(branches);
-        }
-    }
-    let mut patch_of: HashMap<u64, u32> = HashMap::with_capacity(per_cell.len());
-    let mut patch_cells: Vec<usize> = Vec::new();
-    let mut patch_branches: Vec<usize> = Vec::new();
     let mut patch_max: Vec<usize> = Vec::new();
     if !per_cell.is_empty() {
         let mut frontier: Vec<u64> = Vec::new();
@@ -338,11 +297,9 @@ pub fn via_census(filaments: &[Filament], bin_m: f64, threshold: Option<usize>) 
             conv_cells: 0,
             conv_branches: 0,
             conv_patches: 0,
-            conv_patch_branches: 0,
             tab_cells: 0,
             tab_branches: 0,
             tab_patches: 0,
-            tab_patch_branches: 0,
         };
         for (index, &cells) in patch_cells.iter().enumerate() {
             // The engine's decision unit is the patch: a patch holds a
@@ -350,12 +307,10 @@ pub fn via_census(filaments: &[Filament], bin_m: f64, threshold: Option<usize>) 
             // homogenizes; every other patch stays explicit tabs.
             if patch_max[index] >= t {
                 split.conv_patches += 1;
-                split.conv_patch_branches += patch_branches[index];
                 split.conv_cells += cells;
                 split.conv_branches += patch_branches[index];
             } else {
                 split.tab_patches += 1;
-                split.tab_patch_branches += patch_branches[index];
                 split.tab_cells += cells;
                 split.tab_branches += patch_branches[index];
             }
@@ -744,11 +699,34 @@ mod via_tests {
         assert_eq!(census.vias_per_cluster, vec![0, 3, 0]);
         let split = census.threshold.expect("split evaluated");
         assert_eq!(split.conv_patches, 1);
-        assert_eq!(split.conv_patch_branches, 2);
+        assert_eq!(split.conv_branches, 2);
         assert_eq!(split.conv_cells, 1);
         assert_eq!(split.tab_patches, 1);
-        assert_eq!(split.tab_patch_branches, 1);
+        assert_eq!(split.tab_branches, 1);
         assert_eq!(split.tab_cells, 1);
+    }
+
+    #[test]
+    fn via_census_one_hot_cell_taints_its_whole_patch() {
+        // Cell A holds 2 stacked vias, adjacent cell B holds 1.
+        // Threshold 2 fires on A only - but the patch decision unit
+        // homogenizes the whole connected field: conv_cells == 2,
+        // conv_branches == 3, zero tab patches. This is the semantic
+        // the ThresholdSplit changed to mid-edit; pinned here after
+        // the slice-1 audit found it was only tested degenerately.
+        let filaments = vec![
+            via(0.0, 0.0, 0.0, 7.0e-5),
+            via(0.0, 0.0, 0.0, 7.0e-5),
+            via(1.5e-3, 0.0, 0.0, 7.0e-5),
+            via(9.0e-3, 9.0e-3, 0.0, 7.0e-5),
+        ];
+        let census = via_census(&filaments, 1.0e-3, Some(2));
+        let split = census.threshold.expect("split evaluated");
+        assert_eq!(split.conv_patches, 1);
+        assert_eq!(split.conv_cells, 2);
+        assert_eq!(split.conv_branches, 3);
+        assert_eq!(split.tab_patches, 1);
+        assert_eq!(split.tab_branches, 1);
     }
 
     #[test]
