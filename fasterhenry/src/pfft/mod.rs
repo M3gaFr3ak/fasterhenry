@@ -417,7 +417,7 @@ impl PfftOperator {
             fft_gb,
             fft_gb / 3.0,
         );
-        // **[superseded 2026-10-20, ekart A/B lane - the whole
+        // **[superseded 2026-10-19, ekart A/B lane - the whole
         // fixture-calibrated near-pair extrapolation
         // `pairs_per_fil ~ 35 x k^3 / cpf^1.5` never read the deck
         // (no volume, no density, no aspect); safe for its own
@@ -439,7 +439,7 @@ impl PfftOperator {
         let pairs_gb = pairs_bytes as f64 / 1e9;
         let census_gb = fft_gb + pairs_gb;
         eprintln!(
-            "pfft: near-field census: {} rows, {} directed pairs, exact ({:.1} GB at 24 B/parn)",
+            "pfft: near-field census: {} rows, {} directed pairs, exact ({:.1} GB at 24 B/pair)",
             near_rows.len(),
             pairs_est,
             pairs_gb,

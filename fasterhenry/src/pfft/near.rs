@@ -53,11 +53,10 @@ pub(crate) fn near_pairs(filaments: &[Filament], radius: f64) -> Vec<Vec<u32>> {
 /// pre-flight census in `PfftOperator::new` refuses on this true count
 /// (O(n) memory) instead of the fixture-calibrated extrapolation - the
 /// extrapolation is blind to the deck's density and box aspect and can
-/// miss by factors of ~10 either way on slab/pancake decks (reports a
-/// report: conv-invc4's ekart lane burned four rows on its printout
-/// before the discrepancy was pulled apart). The near walk itself then
-/// re-budgets quantitatively: the binning build (~5% of set-up per the
-/// module doc) is paid twice for the posture's worth.
+/// miss by factors of ~10 either way on slab/pancake decks - the ekart
+/// lane burned four rows on the extrapolation's printout before the
+/// discrepancy was pulled apart). The binning build (~5% of set-up per
+/// the module doc) is paid twice for an honest gate.
 pub(crate) fn near_pairs_count(filaments: &[Filament], radius: f64) -> Vec<u32> {
     let structure = NearBins::build(filaments, radius);
     (0..structure.bars.len())
