@@ -74,6 +74,44 @@ fn main() -> anyhow::Result<()> {
         "load: deck problem built, wall {:.1} s at this point",
         wall.elapsed().as_secs_f64()
     );
+    // Interface census (DECISIONS D17 v1 gate): FASTERHENRY_INTERFACE_CENSUS
+    // set runs it after the problem build and exits; the deck structure
+    // numbers then go on stderr with the radius used.
+    if std::env::var("FASTERHENRY_INTERFACE_CENSUS")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(false)
+    {
+        let radius = match std::env::var("FASTERHENRY_CENSUS_RADIUS_M") {
+            Ok(text) => match text.trim().parse::<f64>() {
+                Ok(value) if value.is_finite() && value > 0.0 => Some(value),
+                _ => anyhow::bail!(
+                    "FASTERHENRY_CENSUS_RADIUS_M must be a positive finite number of metres, got {text:?}"
+                ),
+            },
+            Err(_) => None,
+        };
+        let started = std::time::Instant::now();
+        let census = fasterhenry::census::census_for(
+            &problem.geometry,
+            &problem.ports,
+            &problem.discretization,
+            radius,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        eprintln!(
+            "census: layers {} branches-per-layer {:?} rows-per-layer {:?} spanning-rows {} in-layer-br-pairs {} cross-br-pairs {} csc-cross-entries {} interface-rows {} wall {:.1} s",
+            census.layers,
+            census.branches_per_layer,
+            census.rows_per_layer,
+            census.spanning_rows,
+            census.branch_pairs_in_layer_upper,
+            census.branch_cross_pairs_upper,
+            census.csc_cross_entries,
+            census.interface_rows,
+            started.elapsed().as_secs_f64(),
+        );
+        std::process::exit(0);
+    }
     let override_frequencies = match &freq {
         Some(values) => Some(decade_frequencies(values[0], values[1], values[2])?),
         None => None,

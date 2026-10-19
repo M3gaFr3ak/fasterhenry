@@ -64,6 +64,7 @@
 #![warn(missing_docs)]
 
 pub mod coupling;
+pub mod census;
 mod cubel;
 pub mod dense;
 pub mod filament;
