@@ -116,11 +116,15 @@ pub fn run_reporting(
 ///
 /// The pFFT's grid density reads `FASTERHENRY_PFFT_CPF` (cells per
 /// filament, in metres-of-h terms: lower is a coarser far-field grid).
-/// Accuracy at a fixed near-field radius does not depend on it (the
+/// `FASTERHENRY_PFFT_ORDER` and `FASTERHENRY_PFFT_RADIUS` expose the
+/// interpolation order and near-field radius (in cells) the same way.
+/// Accuracy at a fixed near-field radius does not depend on the cpf (the
 /// [`pfft` module documentation](fasterhenry::pfft) table), but the FFT
-/// volume does, so boards whose padded grid would exceed
-/// [`fasterhenry::pfft::MAX_FFT_POINTS`] use it to fit. A malformed or
-/// non-positive value is a hard error, never a silent default.
+/// volume and the near-pair count trade against each other, so boards whose
+/// padded grid would exceed [`fasterhenry::pfft::MAX_FFT_POINTS`] or whose
+/// near-field estimate would blow the box use them to fit. Malformed,
+/// non-positive or non-finite values are hard errors, never silent
+/// defaults.
 pub fn run_reporting_with(
     problem: &Problem,
     frequency_override: Option<Vec<f64>>,
@@ -142,6 +146,12 @@ pub fn run_reporting_with(
             params.pfft.grid_spacing = GridSpacing::Auto {
                 cells_per_filament: cells,
             };
+        }
+        if let Some(order) = pfft_order_from_env()? {
+            params.pfft.interpolation_order = order;
+        }
+        if let Some(radius) = pfft_radius_from_env()? {
+            params.pfft.near_field_radius = radius;
         }
         let system = IterativeSystem::assemble(
             &problem.geometry,
@@ -189,6 +199,44 @@ fn pfft_cpf_from_env() -> Result<Option<f64>, String> {
     if !parsed.is_finite() || parsed <= 0.0 {
         return Err(format!(
             "FASTERHENRY_PFFT_CPF: must be a positive finite number of cells per filament, got {text:?}"
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+/// The pFFT interpolation order from the environment, or `None` for the
+/// library default. Same hard-error policy as [`pfft_cpf_from_env`]: the
+/// library validates `order >= 1` and `radius >= order + 1`.
+fn pfft_order_from_env() -> Result<Option<usize>, String> {
+    let Ok(text) = std::env::var("FASTERHENRY_PFFT_ORDER") else {
+        return Ok(None);
+    };
+    let parsed: usize = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("FASTERHENRY_PFFT_ORDER: not an integer: {text:?}"))?;
+    if parsed < 1 {
+        return Err(format!(
+            "FASTERHENRY_PFFT_ORDER: must be a positive integer (library floor is 1), got {text:?}"
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+/// The pFFT near-field radius in grid cells from the environment, or `None`
+/// for the library default. Same hard-error policy; the library requires
+/// `radius >= order + 1` and raises it to that floor itself.
+fn pfft_radius_from_env() -> Result<Option<f64>, String> {
+    let Ok(text) = std::env::var("FASTERHENRY_PFFT_RADIUS") else {
+        return Ok(None);
+    };
+    let parsed: f64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("FASTERHENRY_PFFT_RADIUS: not a number: {text:?}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!(
+            "FASTERHENRY_PFFT_RADIUS: must be a positive finite number of cells, got {text:?}"
         ));
     }
     Ok(Some(parsed))

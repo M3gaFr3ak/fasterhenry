@@ -164,8 +164,11 @@ use grid::Grid;
 use near::NearField;
 
 /// Largest padded FFT grid the operator will allocate, in points (each a
-/// 16-byte complex number, several buffers of which exist at once).
-pub const MAX_FFT_POINTS: usize = 1 << 28;
+/// 16-byte complex number, several buffers of which exist at once). 2^38 =
+/// 5.4e8 pts: ~8.6 GB per spectrum-class array, 2-3 of those at once is
+/// 17-26 GB - sized to fit a 59 GB box with the near-field estimate on top;
+/// the local 15 GB box refuses the big grids loudly by this cap regardless.
+pub const MAX_FFT_POINTS: usize = 1 << 29;
 
 /// Filaments per parallel task in the per-filament passes of
 /// [`PfftOperator::apply`].
@@ -247,6 +250,23 @@ pub enum PfftError {
         points: usize,
         /// [`MAX_FFT_POINTS`].
         limit: usize,
+    },
+    /// The pre-allocation memory census exceeded
+    /// `FASTERHENRY_MEMORY_BUDGET_GB`; nothing was allocated.
+    #[error(
+        "pfft memory census: projected ~{estimate_gb:.1} GB (FFT ~{fft_gb:.1} + near pairs ~{pairs_gb:.1}, {pairs_est:.3e} pairs estimated) exceeds the FASTERHENRY_MEMORY_BUDGET_GB={budget_gb:.0} GB budget; lower cpf / near radius, or raise the budget (resolution is fixture-calibrated and holds +-3x)"
+    )]
+    MemoryBudget {
+        /// Projected census total, GB.
+        estimate_gb: f64,
+        /// Configured budget, GB.
+        budget_gb: f64,
+        /// FFT-half of the estimate, GB (deterministic).
+        fft_gb: f64,
+        /// Near-pair estimate half, GB (fixture-calibrated).
+        pairs_gb: f64,
+        /// Estimated directed near pairs.
+        pairs_est: f64,
     },
 }
 
@@ -383,12 +403,66 @@ impl PfftOperator {
                 limit: MAX_FFT_POINTS,
             });
         }
+        // Memory census before any big allocation. The FFT half is
+        // deterministic from the dims (grid.len() and `padded` are already
+        // exact); the near-field half is an estimate - pair counts depend on
+        // geometry, not only on parameters - calibrated as
+        // `pairs_per_filament ~ 35 x k^3 / cpf^1.5` from the 40k-filament
+        // fixture's measured 799 pairs/branch at k = 8, cpf = 8. The exact
+        // count is printed after `near_pairs` returns. When
+        // FASTERHENRY_MEMORY_BUDGET_GB is set, the estimate exceeding the
+        // budget refuses HERE, before the allocations, instead of dying by
+        // the OOM daemon mid-run.
+        let fft_bytes = 3 * padded * 16;
+        let cpf_nominal = match params.grid_spacing {
+            GridSpacing::Auto { cells_per_filament } => cells_per_filament,
+            GridSpacing::Fixed(_) => grid.len() as f64 / n as f64,
+        };
+        // ~24 B/pair (directed pair index + precorrect scratch headroom).
+        let pairs_per_fil = 35.0 * params.near_field_radius.powi(3) / cpf_nominal.powf(1.5);
+        let pairs_estimate = pairs_per_fil * n as f64;
+        let pairs_bytes = 24.0 * pairs_estimate;
+        let fft_gb = fft_bytes as f64 / 1e9;
+        let pairs_gb = pairs_bytes / 1e9;
+        let census_gb = fft_gb + pairs_gb;
+        eprintln!(
+            "pfft: census: grid {:?}, padded {} pts, FFT ~{:.1} GB (3 x {:.1} GB spectra) + near pairs ~{:.1} GB (est {:.3e} pairs; fixture-calibrated, +-3x) = ~{:.1} GB",
+            grid.dims, padded, fft_gb, fft_gb / 3.0, pairs_gb, pairs_estimate, census_gb,
+        );
+        if let Ok(budget) = std::env::var("FASTERHENRY_MEMORY_BUDGET_GB") {
+            let budget: f64 = budget
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| PfftError::InvalidParameter(
+                    "FASTERHENRY_MEMORY_BUDGET_GB must be a finite number of GB",
+                ))?;
+            if !(budget.is_finite() && budget > 0.0) {
+                return Err(PfftError::InvalidParameter(
+                    "FASTERHENRY_MEMORY_BUDGET_GB must be a finite number of GB",
+                ));
+            }
+            if census_gb > budget {
+                return Err(PfftError::MemoryBudget {
+                    estimate_gb: census_gb,
+                    budget_gb: budget,
+                    fft_gb,
+                    pairs_gb,
+                    pairs_est: pairs_estimate,
+                });
+            }
+        }
         let radius = params.near_field_radius * spacing;
 
         eprintln!("pfft: projecting {} filaments to the grid ...", n);
         let projections = grid::project_all(&grid, filaments, radius);
         eprintln!("pfft: enumerating near-field pairs ...");
         let pairs = near::near_pairs(filaments, radius);
+        eprintln!(
+            "pfft: near-field census: {} directed pairs, exact ({:.1} GB of {} config budget)",
+            pairs.len(),
+            24.0 * pairs.len() as f64 / 1e9,
+            std::env::var("FASTERHENRY_MEMORY_BUDGET_GB").unwrap_or_else(|_| "none".to_string()),
+        );
         eprintln!("pfft: precorrecting near-field (exact kernels) ...");
         let near = near::precorrect(filaments, &grid, &projections, &pairs)?;
 
