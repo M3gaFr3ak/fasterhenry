@@ -427,6 +427,15 @@ pub fn via_patch_membership(
             members[patch as usize].push(branch);
         }
     }
+    // Block membership map: the returned field + the spine's
+    // same-patch exclusion both ride it. Vias first (the via_span
+    // loop), then the qualifying pour members below.
+    let mut block_of_branch: Vec<Option<u32>> = vec![None; filaments.len()];
+    for &(branch, _z0, _z1) in &via_span {
+        if let Some(&patch) = patch_of.get(&cell_of_ceil[&branch]) {
+            block_of_branch[branch] = Some(patch);
+        }
+    }
     if pour_members {
         let owned: HashMap<u64, u32> = patch_of.clone();
         for (branch, filament) in filaments.iter().enumerate() {
@@ -442,21 +451,15 @@ pub fn via_patch_membership(
             let z1 = filament.start().z.max(filament.end().z);
             let (vlo, vhi) = patch_via_z[patch as usize];
             if z1 >= vlo && z0 <= vhi {
-                members[patch as usize].push(branch);
+                let slot = patch as usize;
+                members[slot].push(branch);
+                block_of_branch[branch] = Some(patch);
             }
         }
     }
     ViaMembership {
         members,
-        patch_of_branch: {
-            let mut map: Vec<Option<u32>> = vec![None; filaments.len()];
-            for (&branch, &key) in &cell_of_ceil {
-                if let Some(&patch) = patch_of.get(&key) {
-                    map[branch] = Some(patch);
-                }
-            }
-            map
-        },
+        patch_of_branch: block_of_branch,
         via_branches,
     }
 }

@@ -30,6 +30,19 @@ use fasterhenry::{
 
 const COPPER: f64 = 5.8e7;
 
+/// Serialises the process-global FASTERHENRY_* env state across the
+/// parity tests: cargo runs a binary's tests on multiple threads, so
+/// the two `set_var`-based sweeps could interpolate each other's
+/// faces (conv-inc4 audit F4 - the collision mostly weakens
+/// assertions rather than failing them, i.e. a run can pass vacuously).
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn port(positive: usize, negative: usize) -> Port {
     Port::new(NodeId(positive), NodeId(negative))
 }
@@ -95,6 +108,7 @@ fn three_layer_structure() -> (Geometry, Vec<Port>, Discretization) {
 
 #[test]
 fn conv_precond_matches_the_dense_path() {
+    let _env = env_lock();
     std::env::set_var("FASTERHENRY_PRECOND", "conv");
     let (geometry, ports, discretization) = three_layer_structure();
     let dense = MeshSystem::assemble(&geometry, &ports, &discretization).unwrap();
@@ -135,6 +149,7 @@ fn conv_precond_matches_the_dense_path() {
 
 #[test]
 fn tab_compositions_never_change_the_answer() {
+    let _env = env_lock();
     // The tab knob may change precond quality, never the answer: each
     // composition's reference is the same dense path (precision at
     // 1 kHz + convergence at 5 MHz), the two frequency-less knob
@@ -170,6 +185,7 @@ fn tab_compositions_never_change_the_answer() {
 
 #[test]
 fn spine_compositions_never_change_the_answer() {
+    let _env = env_lock();
     // Same discipline as the tab knob: the spine's composition may
     // move iterations, never the answer - the GMRES referee sees the
     // true operator.

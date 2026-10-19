@@ -1030,6 +1030,49 @@ mod layer_pair_tests {
     }
 
     #[test]
+    fn spine_excludes_the_blocking_landing_pours() {
+        // The increment-3 deck's single patch carries its landing
+        // pours ([11, 2, 5, 8] members): those near partners must ride
+        // the BLOCK exactly once and stay SPINE-ABSENT, while the
+        // bin-adjacent pours outside the patch's cells ride the spine
+        // (conv-inc4 audit F1: with via-only patch ids the block
+        // members slipped into the spine as well and were counted
+        // twice).
+        let deck = deck();
+        let resistances = vec![1.0e-6; deck.len()];
+        let omega = std::f64::consts::TAU * 1.0e3;
+        let spine = ConvPrecond::build_spine(
+            &deck,
+            &resistances,
+            omega,
+            TabComposition::Both,
+            PITCH,
+            true,
+        )
+        .expect("deck builds a spine");
+        let spine = spine.expect("a deck with a via carries a spine");
+        let lo = spine.row_ptr[0] as usize;
+        let hi = spine.row_ptr[1] as usize;
+        // The via's spine row must EXCLUDE the block members (2, 5,
+        // 8 cross or share its cells) and carry the bin-adjacent
+        // pours whose centres sit OUTSIDE the patch's cells: 1 (the
+        // y-apart x-pour), 3, 7 and 9 (the 1 mm-away y-pours).
+        assert_eq!(
+            spine.col[lo..hi].to_vec(),
+            vec![1u32, 3, 7, 9],
+            "the via's spine row: only the block-free partners"
+        );
+        for (index, &partner) in spine.col[lo..hi].iter().enumerate() {
+            let expected = inductance::mutual_inductance(&deck[11], &deck[partner as usize])
+                .expect("spine pair admits the exact kernel");
+            assert!(
+                (spine.values[lo + index] - expected).abs() < 1.0e-15,
+                "spine entry (11,{partner}) must be the exact mutual"
+            );
+        }
+    }
+
+    #[test]
     fn spine_carries_block_free_via_pairs_only() {
         // Two separate patches: vias at the (0,0) and (3,0) census
         // cells (4-connected flood fill keeps them apart at a 1 mm
@@ -1229,16 +1272,15 @@ mod layer_pair_tests {
 //   `r_agg * delta(d) + j omega * M(d)` - bounded gain at every
 //   frequency, so the inner solve cannot poison the outer GMRES
 //   (failmode-2 guard);
-// - the explicit tab blocks COMPOSED here since increment 3 (fork
-//   0e27478, census-patch membership + exact LU blocks; env
-//   FASTERHENRY_CONV_TABS controls the composition, both default);
-//   the branch-CSR spine remains the reserved slot, booked as 2d:
-//   couplings it would carry are simply absent from the model - the
-//   answer stays operator-exact (GMRES referee), only precond
-//   quality is dimmed.
-//   **[corrected 2026-10-20, conv-inc3 audit F1 - this header's tab
-//   half was left stale by the very commit that shipped the tabs;
-//   spine half still current as of this marker]**
+// - the explicit tab blocks AND the cross spine both COMPOSED here:
+//   tabs since increment 3 (fork 0e27478, census-patch membership +
+//   exact LU blocks; env FASTERHENRY_CONV_TABS), the spine since
+//   increment 4 (fork 0e53ff0, block-free via pairs + damped Jacobi;
+//   env FASTERHENRY_CONV_SPINE) - both composition-selectable with
+//   BOTH default; no remaining reserved slots in the near model.
+//   **[corrected 2026-10-20, conv-inc4 audit F2 - this header's
+//   spine half was left stale by the very commit that shipped the
+//   spine (the inc3 audit's F1 pattern repeating)]**
 // ---------------------------------------------------------------------------
 
 /// One (layer pair, axis family) population pair of the smoother.
@@ -1780,8 +1822,9 @@ impl TabBlock {
 /// stored (slot-indexed CSR); the flux apply scatters both directions
 /// since mutuals are symmetric. The `Both` composition's smoother
 /// stage is a damped Jacobi pass over the via rows, denominators the
-/// branch's own near-model diagonal `R + j omega L_self` (real parts
-/// in the re side, bounded gain, fixed per frequency).
+/// branch's near-model local scale `R + j omega (L_self + row-sum
+/// |L|)` (real parts in the re side, bounded gain, fixed per
+/// frequency).
 pub struct SpineCsr {
     /// Slot (via) row boundaries over `col`/`values`, length
     /// `vias.len() + 1`.
