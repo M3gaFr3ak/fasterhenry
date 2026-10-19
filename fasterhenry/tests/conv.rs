@@ -6,8 +6,12 @@
 //! never answer wrong. What this test pins is the plumbing (scatter to
 //! `LayerPairOperator`/`ConvPrecond`, Richardson smoother, T lift)
 //! plus convergence; iteration counts (precond quality) are logged,
-//! not asserted - the tab blocks and the cross-CSR spine are still
-//! reserved slots (increments 2c/2d).
+//! not asserted - the tab blocks compose explicitly since increment 3
+//! (0e27478; the parity tripwire below across all three
+//! FASTERHENRY_CONV_TABS compositions) while the cross-CSR spine is
+//! still a reserved slot (increment 2d).
+//! **[corrected 2026-10-20, conv-inc3 audit F1: the tab half was
+//! stale, pre-0e27478 wording]**
 //!
 //! Deck shape matters: the loop space must hold PLANE-scale cycles
 //! (junctions between strokes), or the residuals collapse into

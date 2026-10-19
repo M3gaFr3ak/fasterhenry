@@ -361,9 +361,12 @@ pub struct ViaMembership {
     /// Patch member branch indices: vias at the branches' own order,
     /// then the qualifying pour members, patch by patch.
     pub members: Vec<Vec<usize>>,
-    /// Via branches that no patch contains (impossible by
-    /// construction: every via defines/occupies a cell) - kept for
-    /// symmetry with the option-of-absence engine APIs.
+    /// Total z-directed (via barrel) branches the scan saw. Aggregate
+    /// sizing only - every via defines/occupies a cell by
+    /// construction, so every counted branch also exits in exactly
+    /// one patch's member list. **[corrected 2026-10-20, conv-inc3
+    /// audit F2: the first-draft doc described a no-patch set the
+    /// count does not hold]**
     pub via_branches: usize,
 }
 

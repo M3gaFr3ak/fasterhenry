@@ -658,10 +658,20 @@ impl ConvCore {
                 true
             }
         };
-        let tab_bin_m = std::env::var("FASTERHENRY_CENSUS_VIA_BIN_M")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| crate::census::derived_radius(&system.filaments));
+        let tab_bin_m =
+            // The bin chain mirrors the census CLI's `census_for`
+            // fallback exactly (audit fold F3, 2026-10-20): histogram
+            // pitch and tab-membership pitch must not skew apart on
+            // one deck.
+            std::env::var("FASTERHENRY_CENSUS_VIA_BIN_M")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .or_else(|| {
+                    std::env::var("FASTERHENRY_CENSUS_RADIUS_M")
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or_else(|| crate::census::derived_radius(&system.filaments));
         let core = ConvPrecond::build(
             &system.filaments,
             &system.resistances,

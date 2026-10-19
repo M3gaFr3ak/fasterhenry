@@ -1142,10 +1142,16 @@ mod layer_pair_tests {
 //   `r_agg * delta(d) + j omega * M(d)` - bounded gain at every
 //   frequency, so the inner solve cannot poison the outer GMRES
 //   (failmode-2 guard);
-// - the via-tab blocks and the branch-CSR spine are RESERVED slots,
-//   empty in this increment (booked as 2c/2d): couplings they would
-//   carry are simply absent from the model - the answer stays
-//   operator-exact (GMRES referee), only precond quality is dimmed.
+// - the explicit tab blocks COMPOSED here since increment 3 (fork
+//   0e27478, census-patch membership + exact LU blocks; env
+//   FASTERHENRY_CONV_TABS controls the composition, both default);
+//   the branch-CSR spine remains the reserved slot, booked as 2d:
+//   couplings it would carry are simply absent from the model - the
+//   answer stays operator-exact (GMRES referee), only precond
+//   quality is dimmed.
+//   **[corrected 2026-10-20, conv-inc3 audit F1 - this header's tab
+//   half was left stale by the very commit that shipped the tabs;
+//   spine half still current as of this marker]**
 // ---------------------------------------------------------------------------
 
 /// One (layer pair, axis family) population pair of the smoother.
