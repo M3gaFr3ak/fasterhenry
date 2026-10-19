@@ -75,7 +75,7 @@ use nalgebra::{ComplexField, DMatrix, Dyn, LU};
 use num_complex::Complex;
 use rayon::prelude::*;
 
-use crate::conv::{mesh_gather, mesh_scatter, ConvPrecond};
+use crate::conv::{mesh_gather, mesh_scatter, ConvPrecond, TabComposition};
 use crate::cubel::{CubelGlobal, CubelParams, CubelPattern, AVER_ROWS};
 use crate::filament::Filament;
 use crate::geometry::Geometry;
@@ -627,8 +627,51 @@ impl ConvCore {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(2)
             .max(1);
-        let core = ConvPrecond::build(&system.filaments, &system.resistances, omega, damp)
-            .map_err(SolveError::from)?;
+        // Tab chassis (2c): FASTERHENRY_CONV_TABS=both|matvec|off
+        // (default both), FASTERHENRY_CONV_TAB_POUR=0|1 (default 1),
+        // via-census bin FASTERHENRY_CENSUS_VIA_BIN_M or the census's
+        // derived first guess.
+        let composition = match std::env::var("FASTERHENRY_CONV_TABS")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("both") => TabComposition::Both,
+            Some("matvec") => TabComposition::Matvec,
+            Some("off") => TabComposition::Off,
+            Some(other) => {
+                eprintln!(
+                    "conv: warning: FASTERHENRY_CONV_TABS={other:?} not |both|matvec|off; using both"
+                );
+                TabComposition::Both
+            }
+        };
+        let tab_pour = match std::env::var("FASTERHENRY_CONV_TAB_POUR")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("1") | Some("on") | Some("true") => true,
+            Some("0") | Some("off") | Some("false") => false,
+            Some(other) => {
+                eprintln!("conv: warning: FASTERHENRY_CONV_TAB_POUR={other:?} not 0/1; using 1");
+                true
+            }
+        };
+        let tab_bin_m = std::env::var("FASTERHENRY_CENSUS_VIA_BIN_M")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| crate::census::derived_radius(&system.filaments));
+        let core = ConvPrecond::build(
+            &system.filaments,
+            &system.resistances,
+            omega,
+            damp,
+            composition,
+            tab_bin_m,
+            tab_pour,
+        )
+        .map_err(SolveError::from)?;
         Ok(Self {
             core,
             resistances: system.resistances.clone(),

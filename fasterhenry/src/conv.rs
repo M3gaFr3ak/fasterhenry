@@ -952,6 +952,84 @@ mod layer_pair_tests {
     }
 
     #[test]
+    fn tab_blocks_carry_exact_mutuals_and_solve_back() {
+        // The census-patch tab blocks (2c) reproduce the exact
+        // mutuals among the patch members (the via plus both landing
+        // pours of the deck's via cell), and the factored block
+        // solves back: (R + jw L) (A^-1 v) = v at float noise. Pins
+        // the explicit composition's entries and the smoother stage.
+        let deck = deck();
+        let resistances = vec![1.0e-6; deck.len()];
+        let omega = 2.0 * std::f64::consts::PI * 1.0e3;
+        let blocks = ConvPrecond::build_tabs(
+            &deck,
+            &resistances,
+            omega,
+            TabComposition::Both,
+            PITCH,
+            true,
+        )
+        .expect("uniform deck builds tab blocks");
+        assert_eq!(blocks.len(), 1, "one patch: the deck's via cell");
+        let block = &blocks[0];
+        assert_eq!(
+            block.members,
+            // Branch order: the via, the x-pour of its cell, the
+            // antiparallel x-pour sharing it, the y-pour crossing.
+            vec![11usize, 2, 5, 8],
+            "via first (branch order), then the landing pours"
+        );
+        let count = 4usize;
+        let at = |row: usize, col: usize| block.l[row * count + col];
+        let test_err = |delta: f64| (delta.abs() < 1.0e-15);
+        assert!(test_err(at(0, 0) - inductance::self_inductance(&deck[11])));
+        assert!(test_err(at(1, 1) - inductance::self_inductance(&deck[2])));
+        // The antiparallel twin sits on branch 2's exact line:
+        // mutual is the negated self L.
+        let twin = inductance::mutual_inductance(&deck[2], &deck[5])
+            .expect("deck pair admits the exact kernel");
+        assert!(test_err(twin + inductance::self_inductance(&deck[2])));
+        assert!(test_err(at(1, 2) - twin));
+        // The via crosses every Manhattan pour: exact zero mutual.
+        assert!(test_err(
+            at(0, 1)
+                - inductance::mutual_inductance(&deck[11], &deck[2])
+                    .expect("deck pair admits the exact kernel")
+        ));
+        assert_eq!(at(0, 1), 0.0);
+        // The x/y pour pair in the cell crosses: exact zero.
+        let pour_crossing = inductance::mutual_inductance(&deck[2], &deck[8])
+            .expect("deck pair admits the exact kernel");
+        assert_eq!(pour_crossing, 0.0);
+        assert!(test_err(at(1, 3) - pour_crossing));
+        assert_eq!(at(3, 1), pour_crossing, "the L block is symmetric");
+        assert!(
+            block.lu.is_some(),
+            "the Both composition factors the smoother block"
+        );
+        // Roundtrip the exact local inverse through the block.
+        let residual: Vec<C64> = vec![C64::new(1.0, -2.0); deck.len()];
+        let mut correction = vec![C64::new(0.0, 0.0); deck.len()];
+        block.solve(&residual, &mut correction);
+        for row in 0..count {
+            let mut sum = C64::new(resistances[block.members[row]], omega * at(row, row))
+                * correction[block.members[row]];
+            for col in 0..count {
+                if col == row {
+                    continue;
+                }
+                sum += C64::new(0.0, omega * at(row, col)) * correction[block.members[col]];
+            }
+            let back = sum - residual[block.members[row]];
+            assert!(
+                back.norm() < 1e-12 * residual[block.members[row]].norm(),
+                "LU solve roundtrip failed: {back} at member {}",
+                block.members[row]
+            );
+        }
+    }
+
+    #[test]
     fn layer_pair_operator_matches_exact_mutuals_on_a_uniform_deck() {
         let filaments = deck();
         let operator = LayerPairOperator::build(&filaments).expect("uniform deck builds");
@@ -1077,6 +1155,9 @@ pub struct ConvPrecond {
     /// inverse of the family's complex kernel; `None` where either
     /// population is empty.
     inverses: Vec<Vec<[[Option<ConvKernel>; 2]; 2]>>,
+    /// The explicit census-patch tab blocks (v2 slice 2c); empty
+    /// under the `Off` composition.
+    tabs: Vec<TabBlock>,
 }
 
 impl ConvPrecond {
@@ -1084,11 +1165,21 @@ impl ConvPrecond {
     /// plus this frequency's per-family inverse kernels. Per-family
     /// diagonal resistance rides the same-layer kernel's zero
     /// displacement as the population's mean branch resistance.
+    ///
+    /// Tab chassis (2c): `composition` selects the explicit
+    /// per-census-patch blocks (`Both` default through the env
+    /// knob); `tab_bin_m` bins the via census (the engine reads
+    /// `FASTERHENRY_CENSUS_VIA_BIN_M` or falls back to
+    /// `derived_radius`); `tab_pour` adds each patch's landing pours
+    /// (`FASTERHENRY_CONV_TAB_POUR=1` default).
     pub fn build(
         filaments: &[Filament],
         resistances: &[f64],
         omega: f64,
         damp: f64,
+        composition: TabComposition,
+        tab_bin_m: f64,
+        tab_pour: bool,
     ) -> Result<Self, KernelError> {
         assert_eq!(
             filaments.len(),
@@ -1132,7 +1223,59 @@ impl ConvPrecond {
             }
             inverses.push(row);
         }
-        Ok(Self { operator, inverses })
+        let tabs = Self::build_tabs(
+            filaments,
+            resistances,
+            omega,
+            composition,
+            tab_bin_m,
+            tab_pour,
+        )?;
+        Ok(Self {
+            operator,
+            inverses,
+            tabs,
+        })
+    }
+
+    /// The explicit per-patch blocks: member branches from the
+    /// census's flood fill, exact dense mutuals among them, LU
+    /// factored when the smoother composition is live.
+    fn build_tabs(
+        filaments: &[Filament],
+        resistances: &[f64],
+        omega: f64,
+        composition: TabComposition,
+        tab_bin_m: f64,
+        tab_pour: bool,
+    ) -> Result<Vec<TabBlock>, KernelError> {
+        if composition == TabComposition::Off {
+            return Ok(Vec::new());
+        }
+        let membership = crate::census::via_patch_membership(filaments, tab_bin_m, tab_pour);
+        let smoother = composition == TabComposition::Both;
+        let mut blocks = Vec::new();
+        for members in membership.members {
+            let count = members.len();
+            if count == 0 {
+                continue;
+            }
+            let mut l = vec![0.0f64; count * count];
+            for row in 0..count {
+                let l_row = inductance::self_inductance(&filaments[members[row]]);
+                for col in row + 1..count {
+                    let mutual = inductance::mutual_inductance(
+                        &filaments[members[row]],
+                        &filaments[members[col]],
+                    )?;
+                    l[row * count + col] = mutual;
+                    l[col * count + row] = mutual;
+                }
+                l[row * (count + 1)] = l_row;
+            }
+            blocks.push(TabBlock::build(members, l, resistances, omega, smoother));
+        }
+        Ok(blocks)
     }
 
     /// The near-model branch drops: `R * current + j omega * L_conv *
@@ -1150,6 +1293,12 @@ impl ConvPrecond {
         let mut flux_im = vec![0.0; count];
         self.operator.apply(&re, &mut flux_re);
         self.operator.apply(&im, &mut flux_im);
+        // The explicit tab blocks: exact dense flux over member
+        // branches; the unconv-representable couplings (vias, tabs)
+        // live here, never in the kernels.
+        for tab in &self.tabs {
+            tab.flux(currents, &mut flux_re, &mut flux_im);
+        }
         (0..count)
             .map(|b| {
                 let r = resistances[b];
@@ -1215,12 +1364,182 @@ impl ConvPrecond {
                 }
             }
         }
+        // The exact per-patch stage: inverse-block solves over each
+        // patch's member residual, additive with the conv families'
+        // corrections (the `Both` composition; a no-op when the LU
+        // is absent).
+        for tab in &self.tabs {
+            tab.solve(residual, &mut correction);
+        }
         correction
     }
 
     /// Test-facing: the raster side.
     pub fn raster(&self) -> usize {
         self.operator.raster()
+    }
+}
+
+/// C64 alias for the tab-block internals (f64-real complex, the
+/// runtime arithmetic of the conv core).
+type C64 = Complex64;
+
+/// How the explicit per-patch tab blocks (v2 slice 2c) compose into
+/// the precond: `Both` feeds the near-model matvec AND an exact
+/// per-patch solve stage in the smoother (default); `Matvec` keeps
+/// the smoother conv-only (quality unchanged, machinery exercisable);
+/// `Off` reproduces the increment-2 model exactly. Env
+/// `FASTERHENRY_CONV_TABS=both|matvec|off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabComposition {
+    #[default]
+    Both,
+    Matvec,
+    Off,
+}
+
+/// One census-patch explicit tab block: the member branches' exact
+/// dense mutual block (the fork's `mutual_inductance`, never a
+/// kernel approximation), living in branch space and composed into
+/// the near-model matvec as flux plus, under the `Both` composition,
+/// an exact `R + j omega L` LU solve as the smoother's per-patch
+/// stage.
+pub struct TabBlock {
+    /// The member branch indices (the block's row/col order).
+    members: Vec<usize>,
+    /// Row-major member-order L (real, RL-only model).
+    l: Vec<f64>,
+    /// Row-major in-place LU of `diag(R_members) + j omega L` plus the
+    /// pivot permutation, when the smoother composition is live
+    /// (`None` under `Matvec`).
+    lu: Option<(Vec<C64>, Vec<usize>)>,
+}
+
+impl TabBlock {
+    /// Blocks are built once per frequency: the LU carries `omega`,
+    /// the exact mutuals do not.
+    fn build(
+        members: Vec<usize>,
+        l: Vec<f64>,
+        resistances: &[f64],
+        omega: f64,
+        smoother: bool,
+    ) -> Self {
+        let count = members.len();
+        assert_eq!(
+            l.len(),
+            count * count,
+            "tab block: one row-major L per member pair"
+        );
+        let lu = if smoother {
+            let mut factored: Vec<C64> = l
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| {
+                    let (row, col) = (index / count, index % count);
+                    C64::new(
+                        if row == col {
+                            resistances[members[row]]
+                        } else {
+                            0.0
+                        },
+                        omega * value,
+                    )
+                })
+                .collect();
+            let mut pivots: Vec<usize> = (0..count).collect();
+            for pivot in 0..count {
+                // Partial-pivot selection scans the PIVOT COLUMN: the
+                // pivot value is the (row, pivot) entry, never the
+                // diagonal (row, col=pivot search collapses to the
+                // diagonal only at pivot time 0).
+                let mut best = pivot;
+                let mut best_norm = factored[pivot * count + pivot].norm();
+                for row in pivot + 1..count {
+                    let norm = factored[row * count + pivot].norm();
+                    if norm > best_norm {
+                        best = row;
+                        best_norm = norm;
+                    }
+                }
+                pivots.swap(pivot, best);
+                for col in 0..count {
+                    factored.swap(pivot * count + col, best * count + col);
+                }
+                let piv = factored[pivot * (count + 1)];
+                let pivot_norm = piv.norm();
+                assert!(
+                    pivot_norm > 0.0,
+                    "tab block: singular smooth matrix (zero resistance? zero mutual?); pivot_norm {pivot_norm}, count {count}, diag {r:?}",
+                    r = (0..count)
+                        .map(|i| factored[i * (count + 1)])
+                        .collect::<Vec<_>>()
+                );
+                for row in pivot + 1..count {
+                    // In-place Doolittle: the L factor lives at
+                    // (row, pivot), not on the diagonal.
+                    let factor = factored[row * count + pivot] / piv;
+                    factored[row * count + pivot] = factor;
+                    for col in pivot + 1..count {
+                        let contribution = factor * factored[pivot * count + col];
+                        factored[row * count + col] -= contribution;
+                    }
+                }
+            }
+            Some((factored, pivots))
+        } else {
+            None
+        };
+        Self { members, l, lu }
+    }
+
+    /// The block's flux contribution: `flux[i] += L[i][j] *
+    /// current[j]` over member pairs (real L, so the caller's real /
+    /// imaginary flux accumulators both take it).
+    fn flux(&self, currents: &[C64], flux_re: &mut [f64], flux_im: &mut [f64]) {
+        let count = self.members.len();
+        for (i, &dst) in self.members.iter().enumerate() {
+            let row = &self.l[i * count..(i + 1) * count];
+            let mut sum_re = 0.0f64;
+            let mut sum_im = 0.0f64;
+            for (j, &src) in self.members.iter().enumerate() {
+                sum_re += row[j] * currents[src].re;
+                sum_im += row[j] * currents[src].im;
+            }
+            flux_re[dst] += sum_re;
+            flux_im[dst] += sum_im;
+        }
+    }
+
+    /// The exact per-patch smoother stage:
+    /// `correction[members] += (diag(R) + j omega L)^-1 residual[members]`.
+    fn solve(&self, residual: &[C64], correction: &mut [C64]) {
+        let Some((factored, pivots)) = &self.lu else {
+            return;
+        };
+        let count = self.members.len();
+        let mut z: Vec<C64> = pivots
+            .iter()
+            .map(|&row| residual[self.members[row]])
+            .collect();
+        // Forward substitution (unit diagonal L).
+        for row in 0..count {
+            for col in 0..row {
+                let contribution = factored[row * count + col] * z[col];
+                z[row] -= contribution;
+            }
+        }
+        // Back substitution.
+        for row in (0..count).rev() {
+            let mut value = z[row];
+            for col in row + 1..count {
+                value -= factored[row * count + col] * z[col];
+            }
+            z[row] = value / factored[row * (count + 1)];
+        }
+        for (slot, &member) in self.members.iter().enumerate() {
+            correction[member] += z[slot];
+        }
     }
 }
 

@@ -128,3 +128,38 @@ fn conv_precond_matches_the_dense_path() {
     assert!(difference < 1.0e-4, "conv at DC differs by {difference:e}");
     std::env::remove_var("FASTERHENRY_PRECOND");
 }
+
+#[test]
+fn tab_compositions_never_change_the_answer() {
+    // The tab knob may change precond quality, never the answer: each
+    // composition's reference is the same dense path (precision at
+    // 1 kHz + convergence at 5 MHz), the two frequency-less knob
+    // faces only enter the near model, and the GMRES referee sees
+    // the true operator.
+    for mode in ["both", "matvec", "off"] {
+        std::env::set_var("FASTERHENRY_PRECOND", "conv");
+        std::env::set_var("FASTERHENRY_CONV_TABS", mode);
+        let (geometry, ports, discretization) = three_layer_structure();
+        let dense = MeshSystem::assemble(&geometry, &ports, &discretization).unwrap();
+        let iterative = IterativeSystem::assemble(
+            &geometry,
+            &ports,
+            &discretization,
+            &IterativeParams::default(),
+        )
+        .unwrap();
+        let expected = dense.impedance(1.0e3).unwrap();
+        let solution = iterative.solve(1.0e3).unwrap();
+        let difference = (solution.impedance.clone() - &expected).norm() / expected.norm();
+        println!("conv tabs={mode} at 1e3 Hz: difference {difference:e}");
+        assert!(
+            difference < 1.0e-4,
+            "conv {mode} at 1e3 Hz: iterative and dense differ by {difference:e}"
+        );
+        for (port_i, outcome) in solution.gmres.iter().enumerate() {
+            assert!(outcome.converged, "conv {mode} port {port_i}: {outcome:?}");
+        }
+    }
+    std::env::remove_var("FASTERHENRY_CONV_TABS");
+    std::env::remove_var("FASTERHENRY_PRECOND");
+}

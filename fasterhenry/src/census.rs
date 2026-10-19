@@ -225,48 +225,13 @@ pub fn via_census(filaments: &[Filament], bin_m: f64, threshold: Option<usize>) 
     // (4-connectivity, same key packing as `bin_key`): the patch is
     // the unit a local threshold acts on - scattered single-cell
     // decisions shatter a via field into mixed conv/tab seams.
-    let mut patch_of: HashMap<u64, u32> = HashMap::with_capacity(per_cell.len());
-    let mut patch_cells: Vec<usize> = Vec::new();
-    let mut patch_branches: Vec<usize> = Vec::new();
-    let mut patch_max: Vec<usize> = Vec::new();
-    if !per_cell.is_empty() {
-        let mut frontier: Vec<u64> = Vec::new();
-        for &key in per_cell.keys() {
-            if patch_of.contains_key(&key) {
-                continue;
-            }
-            let id = patch_cells.len() as u32;
-            patch_of.insert(key, id);
-            frontier.clear();
-            frontier.push(key);
-            let mut cells = 0usize;
-            let mut branches = 0usize;
-            let mut widest = 0usize;
-            while let Some(cell) = frontier.pop() {
-                let count = per_cell[&cell];
-                cells += 1;
-                branches += count;
-                widest = widest.max(count);
-                let bx = (cell >> 32) as i32 as i64;
-                let by = (cell as u32 as i32) as i64;
-                let neighbours = [
-                    (((bx + 1) as u64) << 32) | (by as i64 as u64 & 0xffff_ffff),
-                    (((bx - 1) as u64) << 32) | (by as i64 as u64 & 0xffff_ffff),
-                    ((bx as u64) << 32) | ((by + 1) as i64 as u64 & 0xffff_ffff),
-                    ((bx as u64) << 32) | ((by - 1) as i64 as u64 & 0xffff_ffff),
-                ];
-                for neighbour in neighbours {
-                    if per_cell.contains_key(&neighbour) && !patch_of.contains_key(&neighbour) {
-                        patch_of.insert(neighbour, id);
-                        frontier.push(neighbour);
-                    }
-                }
-            }
-            patch_cells.push(cells);
-            patch_branches.push(branches);
-            patch_max.push(widest);
-        }
-    }
+    let (_patch_of, patch_shape) = flood_fill_cells(&per_cell);
+    let patch_cells: Vec<usize> = patch_shape.iter().map(|&(cells, _, _)| cells).collect();
+    let patch_branches: Vec<usize> = patch_shape
+        .iter()
+        .map(|&(_, branches, _)| branches)
+        .collect();
+    let patch_max: Vec<usize> = patch_shape.iter().map(|&(_, _, widest)| widest).collect();
     let mut size_by_count: HashMap<usize, usize> = HashMap::new();
     let mut largest_cells = 0usize;
     let mut largest_branches = 0usize;
@@ -332,6 +297,151 @@ pub fn via_census(filaments: &[Filament], bin_m: f64, threshold: Option<usize>) 
             size_histogram,
             largest_branches,
         },
+    }
+}
+
+/// 4-connected flood fill over the occupied-cell lattice: the cell ->
+/// patch-id map plus per-patch shape `(cells, via branches, widest
+/// per-cell count)` in discovery order (the same enumeration order
+/// `via_census` always used, so aggregate rows are bit-identical).
+fn flood_fill_cells(
+    per_cell: &HashMap<u64, usize>,
+) -> (HashMap<u64, u32>, Vec<(usize, usize, usize)>) {
+    let mut patch_of: HashMap<u64, u32> = HashMap::with_capacity(per_cell.len());
+    let mut shape: Vec<(usize, usize, usize)> = Vec::new();
+    if per_cell.is_empty() {
+        return (patch_of, shape);
+    }
+    let mut frontier: Vec<u64> = Vec::new();
+    for &key in per_cell.keys() {
+        if patch_of.contains_key(&key) {
+            continue;
+        }
+        let id = shape.len() as u32;
+        patch_of.insert(key, id);
+        frontier.clear();
+        frontier.push(key);
+        let mut cells = 0usize;
+        let mut branches = 0usize;
+        let mut widest = 0usize;
+        while let Some(cell) = frontier.pop() {
+            let count = per_cell[&cell];
+            cells += 1;
+            branches += count;
+            widest = widest.max(count);
+            let bx = (cell >> 32) as i32 as i64;
+            let by = (cell as u32 as i32) as i64;
+            let neighbours = [
+                (((bx + 1) as u64) << 32) | (by as i64 as u64 & 0xffff_ffff),
+                (((bx - 1) as u64) << 32) | (by as i64 as u64 & 0xffff_ffff),
+                ((bx as u64) << 32) | ((by + 1) as i64 as u64 & 0xffff_ffff),
+                ((bx as u64) << 32) | ((by - 1) as i64 as u64 & 0xffff_ffff),
+            ];
+            for neighbour in neighbours {
+                if per_cell.contains_key(&neighbour) && !patch_of.contains_key(&neighbour) {
+                    patch_of.insert(neighbour, id);
+                    frontier.push(neighbour);
+                }
+            }
+        }
+        shape.push((cells, branches, widest));
+    }
+    (patch_of, shape)
+}
+
+/// Per-branch via-patch membership: the conv engine's explicit tab
+/// chassis (v2 slice 2c). Patches are the same 4-connected flood fill
+/// `via_census` reports; a patch's members are its via barrels plus,
+/// under the `pour_members` flag, the manhattan (non-z) branches
+/// whose centre cell belongs to the patch and whose z span intersects
+/// the patch's via z range (the landing pour the stack punches; no z
+/// margin - the conductor's layer scale is microns against a
+/// millimetre bin, so a bin-sized margin would spill far layers in).
+pub struct ViaMembership {
+    /// Patch member branch indices: vias at the branches' own order,
+    /// then the qualifying pour members, patch by patch.
+    pub members: Vec<Vec<usize>>,
+    /// Via branches that no patch contains (impossible by
+    /// construction: every via defines/occupies a cell) - kept for
+    /// symmetry with the option-of-absence engine APIs.
+    pub via_branches: usize,
+}
+
+pub fn via_patch_membership(
+    filaments: &[Filament],
+    bin_m: f64,
+    pour_members: bool,
+) -> ViaMembership {
+    let bin = if bin_m.is_finite() && bin_m > 0.0 {
+        bin_m
+    } else {
+        f64::MIN_POSITIVE
+    };
+    let mut per_cell: HashMap<u64, usize> = HashMap::new();
+    let mut cell_of_ceil: HashMap<usize, u64> = HashMap::new();
+    let mut via_span: Vec<(usize, f64, f64)> = Vec::new();
+    let mut via_branches = 0usize;
+    for (branch, filament) in filaments.iter().enumerate() {
+        if filament.direction().z.abs() < VIA_IS_Z {
+            continue;
+        }
+        via_branches += 1;
+        let centre = filament.center();
+        let key = bin_key(centre.x, centre.y, bin);
+        let entry = per_cell.entry(key).or_insert(0);
+        *entry += 1;
+        cell_of_ceil.insert(branch, key);
+        let z0 = filament.start().z.min(filament.end().z);
+        let z1 = filament.start().z.max(filament.end().z);
+        via_span.push((branch, z0, z1));
+    }
+    let (patch_of, _) = flood_fill_cells(&per_cell);
+    let patch_count = patch_of
+        .values()
+        .copied()
+        .max()
+        .map_or(0, |max| max as usize + 1);
+    // Patch via z ranges (the landing-pour z test's reference).
+    let mut patch_via_z: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::NEG_INFINITY); patch_count];
+    for &(branch, z0, z1) in &via_span {
+        let slot = patch_of[&cell_of_ceil[&branch]] as usize;
+        let range = &mut patch_via_z[slot];
+        range.0 = range.0.min(z0);
+        range.1 = range.1.max(z1);
+    }
+    // Member assembly: patch's vias in branch order, then (per flag)
+    // the qualifying pour members in branch order.
+    let mut members: Vec<Vec<usize>> = Vec::with_capacity(patch_count);
+    for _ in 0..patch_count {
+        members.push(Vec::new());
+    }
+    for &(branch, _z0, _z1) in &via_span {
+        if let Some(&patch) = patch_of.get(&cell_of_ceil[&branch]) {
+            members[patch as usize].push(branch);
+        }
+    }
+    if pour_members {
+        let owned: HashMap<u64, u32> = patch_of.clone();
+        for (branch, filament) in filaments.iter().enumerate() {
+            if filament.direction().z.abs() >= VIA_IS_Z {
+                continue;
+            }
+            let centre = filament.center();
+            let key = bin_key(centre.x, centre.y, bin);
+            let Some(&patch) = owned.get(&key) else {
+                continue;
+            };
+            let z0 = filament.start().z.min(filament.end().z);
+            let z1 = filament.start().z.max(filament.end().z);
+            let (vlo, vhi) = patch_via_z[patch as usize];
+            if z1 >= vlo && z0 <= vhi {
+                members[patch as usize].push(branch);
+            }
+        }
+    }
+    ViaMembership {
+        members,
+        via_branches,
     }
 }
 
@@ -742,5 +852,46 @@ mod via_tests {
         assert_eq!(census.patches.largest_cells, 2);
         assert_eq!(census.patches.largest_branches, 2);
         assert_eq!(census.patches.size_histogram, vec![(1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn membership_groups_vias_by_patch_and_picks_the_landing_pour() {
+        // Two patches: adjacency at 1 mm bins (0 and 1.5 mm via cells
+        // flood fill together; the stray one lands alone). The pour on
+        // the adjacency patch's cell joins it; the off-patch pour and
+        // the far-z pour stay out.
+        let filaments = vec![
+            via(0.0, 0.0, 0.0, 7.0e-5),
+            via(1.5e-3, 0.0, 0.0, 7.0e-5),
+            via(9.0e-3, 9.0e-3, 0.0, 7.0e-5),
+            horizontal(0.5e-3, 0.7e-3, 3.0e-5), // same cell as patch 0
+            horizontal(3.5e-3, 3.7e-3, 3.0e-5), // its own empty cell
+            horizontal(1.0e-3, 1.2e-3, 80.0e-5), // right cell, z too far
+        ];
+        let membership = via_patch_membership(&filaments, 1.0e-3, true);
+        assert_eq!(membership.via_branches, 3);
+        assert_eq!(membership.members.len(), 2);
+        let joined = membership.members.iter().find(|m| m.len() == 3).unwrap();
+        // Vias first (branch order), then the qualifying pour.
+        assert_eq!(
+            joined,
+            &vec![0, 1, 3],
+            "vias in branch order, then the qualifying pour"
+        );
+        let stray = membership.members.iter().find(|m| m.len() == 1).unwrap();
+        assert_eq!(stray, &vec![2]);
+        // Pour-only deck: no vias, no patches, no members.
+        let pours = vec![horizontal(0.0, 1.0e-3, 0.0)];
+        let membership = via_patch_membership(&pours, 1.0e-3, true);
+        assert_eq!(membership.via_branches, 0);
+        assert!(membership.members.is_empty());
+        // Same deck with pours excluded: vias only.
+        let deck = vec![
+            via(0.0, 0.0, 0.0, 7.0e-5),
+            horizontal(0.5e-3, 0.7e-3, 3.0e-5),
+        ];
+        let membership = via_patch_membership(&deck, 1.0e-3, false);
+        assert_eq!(membership.members.len(), 1);
+        assert_eq!(membership.members[0], vec![0]);
     }
 }
