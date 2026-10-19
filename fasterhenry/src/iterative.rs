@@ -87,6 +87,7 @@ use crate::solve::{
     check_frequency, discretize_geometry, filament_resistance, Discretization, SolveError,
     SWEEP_MEMORY_BUDGET_BYTES,
 };
+use crate::twolevel::{TwoLevel, TwoLevelFactors};
 
 type C64 = Complex<f64>;
 
@@ -294,6 +295,7 @@ impl IterativeSystem {
             let precond = match kind {
                 PrecondKind::Cubel => Precond::cubel(self, 0.0)?,
                 PrecondKind::CubelGlobal => Precond::cubel_global(self, 0.0)?,
+                PrecondKind::TwoLevel => Precond::two_level(self, 0.0)?,
                 PrecondKind::None => Precond::Identity,
                 PrecondKind::Jacobi => Precond::Jacobi(self.r_diag.clone()),
             };
@@ -320,6 +322,7 @@ impl IterativeSystem {
             let precond = match kind {
                 PrecondKind::Cubel => Precond::cubel(self, omega)?,
                 PrecondKind::CubelGlobal => Precond::cubel_global(self, omega)?,
+                PrecondKind::TwoLevel => Precond::two_level(self, omega)?,
                 PrecondKind::None => Precond::Identity,
                 PrecondKind::Jacobi => Precond::Jacobi(diagonal),
             };
@@ -468,6 +471,11 @@ enum PrecondKind {
     /// The D-4 letter: one global near-pattern matrix factored by faer's
     /// sparse LU (`FASTERHENRY_PRECOND=cubel-global`).
     CubelGlobal,
+    /// The D-17 first rung: one global near-pattern matrix split by
+    /// copper layer into per-layer blocks plus a cross-layer CSR
+    /// applied in a two-sweep block Gauss-Seidel
+    /// (`FASTERHENRY_PRECOND=two-level`).
+    TwoLevel,
 }
 
 impl PrecondKind {
@@ -476,6 +484,7 @@ impl PrecondKind {
             Ok("none") => PrecondKind::None,
             Ok("cubel") => PrecondKind::Cubel,
             Ok("cubel-global") => PrecondKind::CubelGlobal,
+            Ok("two-level") => PrecondKind::TwoLevel,
             _ => PrecondKind::Jacobi,
         }
     }
@@ -490,6 +499,7 @@ enum Precond<T: ComplexField<RealField = f64> + Copy> {
     Identity,
     Cubel(Box<CubelState<T>>),
     CubelGlobal(Box<CubelGlobalState<T>>),
+    TwoLevel(Box<TwoLevelState<T>>),
 }
 
 /// The built cube preconditioner: the omega-independent pattern plus this
@@ -506,6 +516,13 @@ struct CubelState<T: ComplexField<RealField = f64> + Copy> {
 struct CubelGlobalState<T: ComplexField<RealField = f64> + Copy> {
     global: CubelGlobal,
     factors: Option<faer::sparse::linalg::solvers::Lu<u32, T>>,
+}
+
+/// The built two-level state: the omega-independent layer split plus
+/// this frequency's per-layer factorizations and cross values.
+struct TwoLevelState<T: ComplexField<RealField = f64> + Copy> {
+    pattern: TwoLevel,
+    factors: TwoLevelFactors<T>,
 }
 
 impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> Precond<T> {
@@ -562,6 +579,41 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
         })))
     }
 
+    /// Builds the two-level (D17 v0) state at `omega`.
+    ///
+    /// The pattern radius is independently tunable via
+    /// `FASTERHENRY_TWOL_RADIUS_MULT` (default 2.0): unlike the
+    /// cubel-global knob it defaults ABOVE the operator radius because
+    /// the cross-layer correction is the point - at the operator
+    /// radius the cross set is the blind gap that produced the 365
+    /// -iteration row. Knob scales only the precond pattern (never the
+    /// operator), so `A` is unchanged.
+    fn two_level(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError>
+    where
+        T: crate::cubel::FieldParts,
+    {
+        crate::memgate::set_stage(crate::memgate::STAGE_PRECOND);
+        let radius_mult: f64 = std::env::var("FASTERHENRY_TWOL_RADIUS_MULT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2.0);
+        if !(0.0..=f64::INFINITY).contains(&radius_mult) || radius_mult <= 0.0 {
+            eprintln!(
+                "two-level: warning: FASTERHENRY_TWOL_RADIUS_MULT={radius_mult} invalid; using 2.0"
+            );
+        }
+        let radius_mult = if radius_mult > 0.0 { radius_mult } else { 2.0 };
+        let pattern = TwoLevel::build(
+            &system.mesh,
+            &system.filaments,
+            &system.resistances,
+            system.operator.near_radius() * radius_mult,
+        )
+        .map_err(SolveError::from)?;
+        let factors = pattern.factor::<T>(omega);
+        Ok(Self::TwoLevel(Box::new(TwoLevelState { pattern, factors })))
+    }
+
     fn run(&self, v: &[T]) -> Vec<T> {
         match self {
             Self::Jacobi(d) => v.iter().zip(d.iter()).map(|(&v, &d)| v / d).collect(),
@@ -570,6 +622,7 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
             Self::CubelGlobal(state) => {
                 CubelGlobal::apply_global(state.factors.as_ref(), state.global.n(), v)
             }
+            Self::TwoLevel(state) => state.pattern.apply(&state.factors, v),
         }
     }
 }

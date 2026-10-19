@@ -63,8 +63,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod coupling;
 pub mod census;
+pub mod coupling;
 mod cubel;
 pub mod dense;
 pub mod filament;
@@ -78,6 +78,7 @@ pub mod pfft;
 pub mod plane;
 pub mod result;
 pub mod solve;
+pub mod twolevel;
 
 pub use coupling::{Coupling, CouplingError, TruncationWarning};
 pub use filament::{

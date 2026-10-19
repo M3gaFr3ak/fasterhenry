@@ -169,51 +169,54 @@ fn scan_pair(
     // Orthogonality matches the pattern stage (near.rs thresholds 1e-14).
     const ORTHOGONAL: f64 = 1e-14;
 
-    a_grid.members.par_iter().enumerate().for_each(|(_slot_a, &a)| {
-        let bar = Bar::new(&filaments[a]);
-        let dir_a = filaments[a].direction();
-        let bx = (bar.centre.x / bin_r).floor() as i64;
-        let by = (bar.centre.y / bin_r).floor() as i64;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let key =
-                    ((bx + dx) as u64) << 32 | ((by + dy) as i64 as u64 & 0xffff_ffff);
-                for slot_b in a_grid.slice(key) {
-                    let b = a_grid.members[*slot_b];
-                    if cross {
-                        if b == a {
+    a_grid
+        .members
+        .par_iter()
+        .enumerate()
+        .for_each(|(_slot_a, &a)| {
+            let bar = Bar::new(&filaments[a]);
+            let dir_a = filaments[a].direction();
+            let bx = (bar.centre.x / bin_r).floor() as i64;
+            let by = (bar.centre.y / bin_r).floor() as i64;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    let key = ((bx + dx) as u64) << 32 | ((by + dy) as i64 as u64 & 0xffff_ffff);
+                    for slot_b in a_grid.slice(key) {
+                        let b = a_grid.members[*slot_b];
+                        if cross {
+                            if b == a {
+                                continue;
+                            }
+                        } else if b <= a {
                             continue;
                         }
-                    } else if b <= a {
-                        continue;
-                    }
-                    let bar_b = Bar::new(&filaments[b]);
-                    let delta = bar_b.centre - bar.centre;
-                    if delta.norm() >= radius {
-                        continue;
-                    }
-                    if dir_a.dot(&filaments[b].direction()).abs() < ORTHOGONAL {
-                        continue;
-                    }
-                    if cross {
-                        counters[CROSS_PAIRS].fetch_add(1, Ordering::Relaxed);
-                        let entries = branch_rows[a].len() * branch_rows[b].len();
-                        counters[CROSS_ENTRIES].fetch_add(entries, Ordering::Relaxed);
-                        if let Some(touch) = touched {
-                            for &row in &branch_rows[a] {
-                                touch[row as usize].store(1, Ordering::Relaxed);
-                            }
-                            for &row in &branch_rows[b] {
-                                touch[row as usize].store(1, Ordering::Relaxed);
-                            }
+                        let bar_b = Bar::new(&filaments[b]);
+                        let delta = bar_b.centre - bar.centre;
+                        if delta.norm() >= radius {
+                            continue;
                         }
-                    } else {
-                        counters[IN_LAYER_PAIRS].fetch_add(1, Ordering::Relaxed);
+                        if dir_a.dot(&filaments[b].direction()).abs() < ORTHOGONAL {
+                            continue;
+                        }
+                        if cross {
+                            counters[CROSS_PAIRS].fetch_add(1, Ordering::Relaxed);
+                            let entries = branch_rows[a].len() * branch_rows[b].len();
+                            counters[CROSS_ENTRIES].fetch_add(entries, Ordering::Relaxed);
+                            if let Some(touch) = touched {
+                                for &row in &branch_rows[a] {
+                                    touch[row as usize].store(1, Ordering::Relaxed);
+                                }
+                                for &row in &branch_rows[b] {
+                                    touch[row as usize].store(1, Ordering::Relaxed);
+                                }
+                            }
+                        } else {
+                            counters[IN_LAYER_PAIRS].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
-        }
-    });
+        });
 }
 
 /// The CLI entry point for the census: builds the same mesh the
@@ -226,8 +229,7 @@ pub fn census_for(
     discretization: &crate::solve::Discretization,
     radius: Option<f64>,
 ) -> Result<Census, crate::solve::SolveError> {
-    let (filaments, per_segment) =
-        crate::solve::discretize_geometry(geometry, discretization)?;
+    let (filaments, per_segment) = crate::solve::discretize_geometry(geometry, discretization)?;
     let mesh = crate::mesh::MeshMatrix::build(geometry, &per_segment, ports)?;
     let internal = mesh.internal_count();
     let radius = match radius {
@@ -305,7 +307,7 @@ pub fn interface_census(
     let touch: &[AtomicUsize] = &touched;
 
     let wall = std::time::Instant::now();
-    let mut grids: Vec<LayerGrid> = per_layer_branches
+    let grids: Vec<LayerGrid> = per_layer_branches
         .iter()
         .map(|members| LayerGrid::build(filaments, members, radius))
         .collect();
@@ -317,7 +319,11 @@ pub fn interface_census(
                 &grids[a_layer],
                 radius,
                 a_layer != b_layer,
-                if a_layer != b_layer { Some(touch) } else { None },
+                if a_layer != b_layer {
+                    Some(touch)
+                } else {
+                    None
+                },
                 &counters,
             );
         }
@@ -330,7 +336,12 @@ pub fn interface_census(
         .filter(|t| t.load(Ordering::Relaxed) != 0)
         .count();
     eprintln!(
-        "census: layers {}, branches {:?}", max_layer + 1, per_layer_branches.iter().map(|v| v.len()).collect::<Vec<_>>()
+        "census: layers {}, branches {:?}",
+        max_layer + 1,
+        per_layer_branches
+            .iter()
+            .map(|v| v.len())
+            .collect::<Vec<_>>()
     );
     let _ = wall;
     Census {

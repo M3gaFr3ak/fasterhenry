@@ -436,7 +436,7 @@ fn partition_state(
 /// Peak RSS bookkeeping for the build/factor instrumentation: reads the
 /// kernel's high-water mark so each stage print carries the memory up
 /// to that point (deltas between prints = stage peaks).
-fn hwm_mib() -> usize {
+pub(crate) fn hwm_mib() -> usize {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmHWM:") {
@@ -486,26 +486,26 @@ use faer::traits::ComplexField as FaerComplexField;
 /// Pattern-side data shared with the block-diagonal builder: exact
 /// near-pair mutuals (non-orthogonal upper triangle), self terms, and
 /// branch incidence (which internal rows contain which branch).
-struct NearPairData {
+pub(crate) struct NearPairData {
     /// Near partners in BOTH directions (the upper-triangle mutual list
     /// mirrored), each pair's kernel computed exactly once.
-    partner_all: Vec<Vec<(u32, f64)>>,
-    self_l: Vec<f64>,
+    pub(crate) partner_all: Vec<Vec<(u32, f64)>>,
+    pub(crate) self_l: Vec<f64>,
     /// Incidence of each branch: internal rows containing it plus the
     /// basis sign, cached against 202-wide `mesh.row` rescans.
-    branch_rows: Vec<Vec<BranchIncidence>>,
+    pub(crate) branch_rows: Vec<Vec<BranchIncidence>>,
 }
 
 /// Incidence of branch `a`: the internal rows containing it, with the row
 /// basis's own sign per incidence. Cached so the column accumulator never
 /// rescans `mesh.row(i)` (rows reach 202 branches wide).
 #[derive(Clone)]
-struct BranchIncidence {
-    row: u32,
-    sign: f64,
+pub(crate) struct BranchIncidence {
+    pub(crate) row: u32,
+    pub(crate) sign: f64,
 }
 
-fn near_pair_data(
+pub(crate) fn near_pair_data(
     mesh: &MeshMatrix,
     filaments: &[Filament],
     internal: usize,
