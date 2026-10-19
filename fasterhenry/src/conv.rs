@@ -1420,6 +1420,11 @@ impl ConvPrecond {
         if vias.is_empty() {
             return Ok(None);
         }
+        // Deterministic slot order: the member lists ride the census
+        // HashMap's discovery order, so sort the slots into deck
+        // order (the wanted scan zips its output to this order).
+        let mut vias = vias;
+        vias.sort_unstable();
         // Spine radius = the via census bin, falling to the deck's
         // derived first guess when the bin is degenerate: the engine
         // lever (a CONV_SPINE radius knob) prices at the first ekart
