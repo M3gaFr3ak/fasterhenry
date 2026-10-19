@@ -50,17 +50,30 @@ static FALLBACK_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// generic complex-from-parts constructor, so the list is explicit.
 pub(crate) trait FieldParts: Copy {
     fn of(re: f64, im: f64) -> Self;
+
+    /// Splits a value into (real, imaginary) parts: the conv
+    /// preconditioner's C64 core converts at the run boundary (2026
+    /// -10-20, additive - the real path returns `(re, 0.0)`).
+    fn into_parts(self) -> (f64, f64);
 }
 
 impl FieldParts for f64 {
     fn of(re: f64, _im: f64) -> f64 {
         re
     }
+
+    fn into_parts(self) -> (f64, f64) {
+        (self, 0.0)
+    }
 }
 
 impl FieldParts for Complex<f64> {
     fn of(re: f64, im: f64) -> Complex<f64> {
         Complex::new(re, im)
+    }
+
+    fn into_parts(self) -> (f64, f64) {
+        (self.re, self.im)
     }
 }
 

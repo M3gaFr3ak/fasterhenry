@@ -75,6 +75,7 @@ use nalgebra::{ComplexField, DMatrix, Dyn, LU};
 use num_complex::Complex;
 use rayon::prelude::*;
 
+use crate::conv::{mesh_gather, mesh_scatter, ConvPrecond};
 use crate::cubel::{CubelGlobal, CubelParams, CubelPattern, AVER_ROWS};
 use crate::filament::Filament;
 use crate::geometry::Geometry;
@@ -296,6 +297,7 @@ impl IterativeSystem {
                 PrecondKind::Cubel => Precond::cubel(self, 0.0)?,
                 PrecondKind::CubelGlobal => Precond::cubel_global(self, 0.0)?,
                 PrecondKind::TwoLevel => Precond::two_level(self, 0.0)?,
+                PrecondKind::Conv => Precond::conv_kind(self, 0.0)?,
                 PrecondKind::None => Precond::Identity,
                 PrecondKind::Jacobi => Precond::Jacobi(self.r_diag.clone()),
             };
@@ -323,6 +325,7 @@ impl IterativeSystem {
                 PrecondKind::Cubel => Precond::cubel(self, omega)?,
                 PrecondKind::CubelGlobal => Precond::cubel_global(self, omega)?,
                 PrecondKind::TwoLevel => Precond::two_level(self, omega)?,
+                PrecondKind::Conv => Precond::conv_kind(self, omega)?,
                 PrecondKind::None => Precond::Identity,
                 PrecondKind::Jacobi => Precond::Jacobi(diagonal),
             };
@@ -479,6 +482,15 @@ enum PrecondKind {
     /// prone on cross-heavy patterns (see `crate::twolevel` module
     /// docs). New engines must land as NEW kinds, never reuse this.
     TwoLevel,
+    /// The v2 conv engine (2026-10-20): fully matrix-free near model -
+    /// per-layer-pair FFT kernel applies plus the branch-R diagonal -
+    /// solved inside the apply by a fixed-count Richardson sweep
+    /// whose smoother is the per-family Tikhonov inverse
+    /// (`FASTERHENRY_PRECOND=conv`). Via-tab blocks and the branch-CSR
+    /// spine are reserved slots (increments 2c/2d); until they land
+    /// the model simply omits those couplings, which dims precond
+    /// quality but never the operator-exact answer.
+    Conv,
 }
 
 impl PrecondKind {
@@ -488,6 +500,7 @@ impl PrecondKind {
             Ok("cubel") => PrecondKind::Cubel,
             Ok("cubel-global") => PrecondKind::CubelGlobal,
             Ok("two-level") => PrecondKind::TwoLevel,
+            Ok("conv") => PrecondKind::Conv,
             _ => PrecondKind::Jacobi,
         }
     }
@@ -503,6 +516,7 @@ enum Precond<T: ComplexField<RealField = f64> + Copy> {
     Cubel(Box<CubelState<T>>),
     CubelGlobal(Box<CubelGlobalState<T>>),
     TwoLevel(Box<TwoLevelState<T>>),
+    Conv(Box<ConvCore>),
 }
 
 /// The built cube preconditioner: the omega-independent pattern plus this
@@ -528,12 +542,110 @@ struct TwoLevelState<T: ComplexField<RealField = f64> + Copy> {
     factors: TwoLevelFactors<T>,
 }
 
-impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> Precond<T> {
+/// The built v2 conv state. T-agnostic on purpose: the conv core runs
+/// in C64 and `run` converts at the boundary through `FieldParts`, so
+/// the enum variant itself carries no T.
+struct ConvCore {
+    core: ConvPrecond,
+    /// The branch resistances (owned copy: the near-model diagonal).
+    resistances: Vec<f64>,
+    /// Clone of the incidence the sweeps scatter/gather through.
+    mesh: MeshMatrix,
+    omega: f64,
+    /// Fixed Richardson count inside one precond apply - a fixed
+    /// linear map, as the right-preconditioned GMRES contract needs.
+    sweeps: usize,
+    internal: usize,
+}
+
+impl ConvCore {
+    /// One precond apply: `sweeps` Richardson passes of
+    /// `y <- y + M P M^T (v - M (R + j omega L_conv) M^T y)`.
+    fn run_c64(&self, v: &[C64]) -> Vec<C64> {
+        let mut y = vec![C64::new(0.0, 0.0); self.internal];
+        for _ in 0..self.sweeps {
+            // Residual against the near model: matvec + lift.
+            let b = mesh_scatter(&self.mesh, self.internal, &y);
+            let drops = self.core.near_drops(&b, &self.resistances, self.omega);
+            let ay = mesh_gather(&self.mesh, self.internal, &drops);
+            let residual: Vec<C64> = v.iter().zip(&ay).map(|(&v, &a)| v - a).collect();
+            // Smoother: branch-space Tikhonov inverse + lift.
+            let b_residual = mesh_scatter(&self.mesh, self.internal, &residual);
+            let corr_branch = self.core.smooth(&b_residual);
+            let corr = mesh_gather(&self.mesh, self.internal, &corr_branch);
+            for (y, c) in y.iter_mut().zip(&corr) {
+                *y += *c;
+            }
+        }
+        y
+    }
+}
+
+/// The conv apply's T boundary: the core runs C64, `run` hands back T.
+fn conv_apply<T: ComplexField<RealField = f64> + Copy + crate::cubel::FieldParts>(
+    core: &ConvCore,
+    v: &[T],
+) -> Vec<T> {
+    let input: Vec<C64> = v
+        .iter()
+        .map(|&t| {
+            let (re, im) = t.into_parts();
+            C64::new(re, im)
+        })
+        .collect();
+    core.run_c64(&input)
+        .into_iter()
+        .map(|c| T::of(c.re, c.im))
+        .collect()
+}
+
+impl ConvCore {
+    /// Builds the v2 conv state at `omega`.
+    ///
+    /// Knobs: `FASTERHENRY_CONV_DAMP` (Tikhonov floor of the smoother
+    /// kernels, default 0.01, valid range (0, 1)) and
+    /// `FASTERHENRY_CONV_SWEEPS` (fixed Richardson count per apply,
+    /// default 2). Kernels are resampled per frequency (`omega` rides
+    /// the smoother's complex kernel, not the forward ones); kernel
+    /// caching across frequencies is a booked cost lever.
+    fn build_state(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError> {
+        crate::memgate::set_stage(crate::memgate::STAGE_PRECOND);
+        let mut damp: f64 = std::env::var("FASTERHENRY_CONV_DAMP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.01);
+        if !(0.0..1.0).contains(&damp) {
+            eprintln!("conv: warning: FASTERHENRY_CONV_DAMP={damp} outside (0, 1); using 0.01");
+            damp = 0.01;
+        }
+        if damp <= 0.0 {
+            eprintln!("conv: warning: FASTERHENRY_CONV_DAMP=0 not permitted; using 0.01");
+            damp = 0.01;
+        }
+        let sweeps: usize = std::env::var("FASTERHENRY_CONV_SWEEPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2)
+            .max(1);
+        let core = ConvPrecond::build(&system.filaments, &system.resistances, omega, damp)
+            .map_err(SolveError::from)?;
+        Ok(Self {
+            core,
+            resistances: system.resistances.clone(),
+            mesh: system.mesh.clone(),
+            omega,
+            sweeps,
+            internal: system.mesh.internal_count(),
+        })
+    }
+}
+
+impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> Precond<T>
+where
+    T: crate::cubel::FieldParts,
+{
     /// Builds the CUBEL state at `omega` from the system's own pieces.
-    fn cubel(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError>
-    where
-        T: crate::cubel::FieldParts,
-    {
+    fn cubel(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError> {
         let pattern = CubelPattern::build(
             &system.mesh,
             &system.filaments,
@@ -553,10 +665,7 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
     /// preconditioner's near-pattern, never the operator's precorrect
     /// radius or the pFFT grid, so `A` is unchanged and the knob trades
     /// memory (pattern CSC + LU fill, ~r^2 scaling) for iterations.
-    fn cubel_global(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError>
-    where
-        T: crate::cubel::FieldParts,
-    {
+    fn cubel_global(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError> {
         crate::memgate::set_stage(crate::memgate::STAGE_PRECOND);
         let radius_mult: f64 = std::env::var("FASTERHENRY_CUBEL_RADIUS_MULT")
             .ok()
@@ -582,6 +691,12 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
         })))
     }
 
+    /// Builds the v2 conv state at `omega` (see `ConvCore::build_state`).
+    fn conv_kind(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError> {
+        let core = ConvCore::build_state(system, omega)?;
+        Ok(Self::Conv(Box::new(core)))
+    }
+
     /// Builds the two-level (D17 v0) state at `omega`.
     ///
     /// The pattern radius is independently tunable via
@@ -591,10 +706,7 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
     /// radius the cross set is the blind gap that produced the 365
     /// -iteration row. Knob scales only the precond pattern (never the
     /// operator), so `A` is unchanged.
-    fn two_level(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError>
-    where
-        T: crate::cubel::FieldParts,
-    {
+    fn two_level(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError> {
         crate::memgate::set_stage(crate::memgate::STAGE_PRECOND);
         let radius_mult: f64 = std::env::var("FASTERHENRY_TWOL_RADIUS_MULT")
             .ok()
@@ -626,6 +738,7 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
                 CubelGlobal::apply_global(state.factors.as_ref(), state.global.n(), v)
             }
             Self::TwoLevel(state) => state.pattern.apply(&state.factors, v),
+            Self::Conv(core) => conv_apply::<T>(core, v),
         }
     }
 }
@@ -640,6 +753,8 @@ fn schur_complement_gmres<T>(
 ) -> Result<(DMatrix<T>, Vec<GmresOutcome>), SolveError>
 where
     T: ComplexField<RealField = f64> + Copy + Sync + Send + FaerComplexField,
+    // The conv engine's run converts T <-> C64 at the boundary.
+    T: crate::cubel::FieldParts,
 {
     let internal = ep.nrows();
     if internal == 0 {

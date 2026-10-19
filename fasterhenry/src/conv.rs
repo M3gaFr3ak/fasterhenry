@@ -21,6 +21,8 @@
 //!   (the raster sizing is ladder territory), never accuracy.
 
 use num_complex::Complex64;
+use std::sync::Arc;
+
 use rustfft::{Fft, FftPlanner};
 
 /// Damped spectral inverse of one displacement-domain kernel.
@@ -34,12 +36,20 @@ pub struct ConvKernel {
     /// and future diagnostics.
     kernel_hat: Vec<Complex64>,
     /// The displacement-domain samples before the FFT (the same
-    /// wrapped layout): the value a single-source probe reads back.
-    kernel_time: Vec<f64>,
+    /// wrapped layout). The real part is what a single-source probe
+    /// reads back; complex-sample kernels keep the full value here
+    /// and only the real `LayerPairOperator` kernels are introspected.
+    kernel_time: Vec<Complex64>,
     /// The damped inverse spectrum - what the apply multiplies by.
     inverse_hat: Vec<Complex64>,
     /// The regularization floor used, `(damp * peak)^2`.
     epsilon: f64,
+    /// Cached FFT plans: planning again per apply would dominate the
+    /// engine's per-iteration cost (2026-10-20; the acceptance deck's
+    /// debug run measured planning-heavy applies at ~100 s vs 7 s
+    /// cached at release).
+    fft: Arc<dyn Fft<f64>>,
+    ifft: Arc<dyn Fft<f64>>,
 }
 
 impl ConvKernel {
@@ -50,6 +60,26 @@ impl ConvKernel {
     /// the spectral multiply only preserves magnitude then).
     /// `damp` in `(0, 1)` sets the regularization floor.
     pub fn build(n: usize, cell_m: f64, sample: impl Fn(f64, f64) -> f64, damp: f64) -> Self {
+        Self::build_complex(
+            n,
+            cell_m,
+            |dx, dy| Complex64::new(sample(dx, dy), 0.0),
+            damp,
+        )
+    }
+
+    /// Complex-sample build. The Wiener inverse becomes
+    /// `conj(h) / (|h|^2 + eps)` - the Tikhonov-regularized pseudo
+    /// inverse of the family operator, bounded by `1 / (2 * sqrt eps)`
+    /// at every frequency for COMPLEX kernels too (the GMRES
+    /// failmode-2 guard carries over verbatim). For real samples this
+    /// reduces exactly to the re-signed real form.
+    pub fn build_complex(
+        n: usize,
+        cell_m: f64,
+        sample: impl Fn(f64, f64) -> Complex64,
+        damp: f64,
+    ) -> Self {
         assert!(n >= 3, "conv kernel raster too small: {n}");
         assert!(
             cell_m.is_finite() && cell_m > 0.0,
@@ -79,28 +109,48 @@ impl ConvKernel {
         let mut plane: Vec<Complex64> = Vec::with_capacity(n * n);
         for row in 0..n as i64 {
             for col in 0..n as i64 {
-                plane.push(Complex64::new(
-                    sample(raw_displacement(row), raw_displacement(col)),
-                    0.0,
-                ));
+                plane.push(sample(raw_displacement(row), raw_displacement(col)));
             }
         }
-        let kernel_time: Vec<f64> = plane.iter().map(|v| v.re).collect();
+        let kernel_time: Vec<Complex64> = plane.clone();
         let fft = FftPlanner::new().plan_fft_forward(n);
         apply_fft2(&*fft, &mut plane);
         let mut peak = 0.0f64;
         for value in &plane {
-            peak = peak.max(value.re.abs().max(value.im.abs()));
+            peak = peak.max(value.norm());
+        }
+        let mut inverse_hat = Vec::with_capacity(n * n);
+        let fft: Arc<dyn Fft<f64>> = FftPlanner::new().plan_fft_forward(n);
+        let ifft: Arc<dyn Fft<f64>> = FftPlanner::new().plan_fft_inverse(n);
+        if peak == 0.0 {
+            // A structurally zero kernel (perpendicular families, or a
+            // cross layer at DC) has no coupling to invert: the Wiener
+            // formula `conj(h) / (|h|^2 + eps)` would produce 0/0 = NaN
+            // per band, so the inverse is defined as all-zero instead
+            // (2026-10-20, accepted-deck diagnosis).
+            for _ in 0..plane.len() {
+                inverse_hat.push(Complex64::new(0.0, 0.0));
+            }
+            return ConvKernel {
+                n,
+                cell_m,
+                kernel_hat: plane,
+                kernel_time,
+                inverse_hat,
+                epsilon: 0.0,
+                fft,
+                ifft,
+            };
         }
         let epsilon = (damp * peak).powi(2);
-        let mut inverse_hat = Vec::with_capacity(n * n);
         for value in &plane {
-            // An even real kernel has a real spectrum up to FFT
-            // rounding: the re-signed inversion preserves each band's
-            // coupling sign (negative-mutual bands correct with the
-            // right polarity).
-            let h = value.re;
-            inverse_hat.push(Complex64::new(h / (h * h + epsilon), 0.0));
+            // Tikhonov-regularized pseudo inverse: `conj(h) / (|h|^2 +
+            // eps)`. A real spectrum reduces to the re-signed real
+            // form (the coupling sign of negative-mutual bands is
+            // preserved); a complex kernel gets the least-squares
+            // flavor, bounded at 1 / (2 * sqrt(eps)) either way.
+            let denom = value.norm().powi(2) + epsilon;
+            inverse_hat.push(value.conj() / denom);
         }
         ConvKernel {
             n,
@@ -109,6 +159,8 @@ impl ConvKernel {
             kernel_time,
             inverse_hat,
             epsilon,
+            fft,
+            ifft,
         }
     }
 
@@ -124,13 +176,11 @@ impl ConvKernel {
             "field size must equal the kernel raster"
         );
         let n = self.n;
-        let fft = FftPlanner::new().plan_fft_forward(n);
-        let ifft = FftPlanner::new().plan_fft_inverse(n);
-        apply_fft2(&*fft, field);
+        apply_fft2(&*self.fft, field);
         for (value, gain) in field.iter_mut().zip(&self.inverse_hat) {
             *value = *value * *gain;
         }
-        apply_fft2(&*ifft, field);
+        apply_fft2(&*self.ifft, field);
         // The circular-convolution identity
         // `IFFT2_unnorm(FFT2_unnorm(y) * H) / n^2 = y (asterisk) h`
         // pins the normalization: rustfft leaves both directions
@@ -153,13 +203,11 @@ impl ConvKernel {
             "field size must equal the kernel raster"
         );
         let n = self.n;
-        let fft = FftPlanner::new().plan_fft_forward(n);
-        let ifft = FftPlanner::new().plan_fft_inverse(n);
-        apply_fft2(&*fft, field);
+        apply_fft2(&*self.fft, field);
         for (value, gain) in field.iter_mut().zip(&self.kernel_hat) {
             *value = *value * *gain;
         }
-        apply_fft2(&*ifft, field);
+        apply_fft2(&*self.ifft, field);
         let norm = 1.0 / (n * n) as f64;
         for value in field.iter_mut() {
             *value = *value * norm;
@@ -386,11 +434,12 @@ struct LayerPlane {
     filaments: [Vec<(usize, f64)>; 2],
 }
 
-/// A filament's raster placement: the positional projection plus the
+/// A filament's raster placement (crate-internal type returned by
+/// `LayerPairOperator::placement`): the positional projection plus the
 /// filament's direction sign relative to the +axis reference (the
 /// single source of truth for the write/read folding).
 #[derive(Clone, Copy)]
-struct Place {
+pub(crate) struct Place {
     layer: usize,
     axis: usize,
     cell: usize,
@@ -648,6 +697,27 @@ impl LayerPairOperator {
         self.place.iter().filter(|p| p.is_some()).count()
     }
 
+    /// One layer-axis population (the inverse-kernel builder needs
+    /// the same membership pass).
+    pub(crate) fn population(&self, layer: usize, axis: usize) -> &[(usize, f64)] {
+        &self.layers[layer].filaments[axis]
+    }
+
+    /// The layer count (the populations' outer index bound).
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// The branch count every per-branch vector this operator binds.
+    pub(crate) fn branch_count(&self) -> usize {
+        self.place.len()
+    }
+
+    /// One filament's raster placement.
+    pub(crate) fn placement(&self, branch: usize) -> Option<&Place> {
+        self.place[branch].as_ref()
+    }
+
     /// The conv operator value the apply produces for one ordered
     /// branch pair (test introspection: the kernel sample at the
     /// centre displacement). `None` for uncovered branches, empty
@@ -666,8 +736,83 @@ impl LayerPairOperator {
         // RAW wrapped layout: negative displacements mod n.
         let raw = |d: i64| d.rem_euclid(self.n as i64) as usize;
         let index = raw(row) * self.n + raw(col);
-        Some(src.sign * dst.sign * kernel.kernel_time[index])
+        // The introspected kernels are the forward (real-sample)
+        // ones: the operator direction is what the tripwire probes.
+        Some(src.sign * dst.sign * kernel.kernel_time[index].re)
     }
+}
+
+/// `M^T . x` in C64: the first `loops` mesh rows' residual lifted to
+/// branch-space flux-like values. Used by the v2 precond's Richardson
+/// sweep (`ConvState` wiring in `iterative.rs`); kept beside the
+/// kernels so the conv engine's data flow reads top to bottom.
+pub(crate) fn mesh_scatter(
+    mesh: &crate::mesh::MeshMatrix,
+    loops: usize,
+    x: &[Complex64],
+) -> Vec<Complex64> {
+    let mut branch = vec![Complex64::new(0.0, 0.0); mesh.branch_count()];
+    for (i, &xi) in x.iter().enumerate().take(loops) {
+        for &(b, sign) in mesh.row(i) {
+            branch[b] += xi * sign;
+        }
+    }
+    branch
+}
+
+/// `M . v` in C64 over the first `loops` mesh rows.
+pub(crate) fn mesh_gather(
+    mesh: &crate::mesh::MeshMatrix,
+    loops: usize,
+    v: &[Complex64],
+) -> Vec<Complex64> {
+    (0..loops)
+        .map(|i| {
+            mesh.row(i)
+                .iter()
+                .fold(Complex64::new(0.0, 0.0), |sum, &(b, sign)| {
+                    sum + v[b] * sign
+                })
+        })
+        .collect()
+}
+
+/// The population's representative segment: median
+/// length/width/height/sigma, median z, +axis direction, explicit
+/// width direction so the cross-section orientation is deterministic.
+fn representative_segment(
+    filaments: &[Filament],
+    population: &[(usize, f64)],
+    axis: usize,
+) -> Segment {
+    let mut lengths = Vec::with_capacity(population.len());
+    let mut widths = Vec::with_capacity(population.len());
+    let mut heights = Vec::with_capacity(population.len());
+    let mut zs = Vec::with_capacity(population.len());
+    let mut sigmas = Vec::with_capacity(population.len());
+    for &(branch, _) in population {
+        let f = &filaments[branch];
+        lengths.push(f.length());
+        widths.push(f.width());
+        heights.push(f.height());
+        zs.push(f.center().z);
+        sigmas.push(f.sigma());
+    }
+    let half = median(&mut lengths) * 0.5;
+    let z = median(&mut zs);
+    let (a, b, width_dir) = if axis == 0 {
+        ([-half, 0.0, z], [half, 0.0, z], [0.0, 1.0, 0.0])
+    } else {
+        ([0.0, -half, z], [0.0, half, z], [1.0, 0.0, 0.0])
+    };
+    Segment::new(
+        Node::from(a),
+        Node::from(b),
+        median(&mut widths),
+        median(&mut heights),
+        median(&mut sigmas),
+    )
+    .with_width_dir(width_dir)
 }
 
 /// Samples one orientation-family kernel: two representative
@@ -687,42 +832,8 @@ fn sample_family_kernel(
     n: usize,
     cell_m: f64,
 ) -> Result<ConvKernel, KernelError> {
-    /// The population's representative segment: median
-    /// length/width/height/sigma, median z, +axis direction, explicit
-    /// width direction so the cross-section orientation is
-    /// deterministic.
-    fn representative(filaments: &[Filament], population: &[(usize, f64)], axis: usize) -> Segment {
-        let mut lengths = Vec::with_capacity(population.len());
-        let mut widths = Vec::with_capacity(population.len());
-        let mut heights = Vec::with_capacity(population.len());
-        let mut zs = Vec::with_capacity(population.len());
-        let mut sigmas = Vec::with_capacity(population.len());
-        for &(branch, _) in population {
-            let f = &filaments[branch];
-            lengths.push(f.length());
-            widths.push(f.width());
-            heights.push(f.height());
-            zs.push(f.center().z);
-            sigmas.push(f.sigma());
-        }
-        let half = median(&mut lengths) * 0.5;
-        let z = median(&mut zs);
-        let (a, b, width_dir) = if axis == 0 {
-            ([-half, 0.0, z], [half, 0.0, z], [0.0, 1.0, 0.0])
-        } else {
-            ([0.0, -half, z], [0.0, half, z], [1.0, 0.0, 0.0])
-        };
-        Segment::new(
-            Node::from(a),
-            Node::from(b),
-            median(&mut widths),
-            median(&mut heights),
-            median(&mut sigmas),
-        )
-        .with_width_dir(width_dir)
-    }
-    let src_segment = representative(filaments, source_population, src_axis);
-    let dst_segment = representative(filaments, victim_population, dst_axis);
+    let src_segment = representative_segment(filaments, source_population, src_axis);
+    let dst_segment = representative_segment(filaments, victim_population, dst_axis);
     let src = Filament::new(&src_segment).expect("representative segment is well-formed");
     let dst_centre = dst_segment.center();
     let (dst_a, dst_b) = (dst_segment.a.position(), dst_segment.b.position());
@@ -740,7 +851,7 @@ fn sample_family_kernel(
         n,
         cell_m,
         |dx, dy| {
-            if same_layer && dx == 0.0 && dy == 0.0 {
+            if same_layer && src_axis == dst_axis && dx == 0.0 && dy == 0.0 {
                 return inductance::self_inductance(&src);
             }
             let offset = Vector3::new(dx, dy, 0.0) - dst_centre;
@@ -871,4 +982,271 @@ mod layer_pair_tests {
         }
         assert_eq!(fluxes[11], 0.0, "the uncovered via must read zero flux");
     }
+
+    /// Same-layer perpendicular strokes sharing a cell: the zero
+    /// displacement of the family is a CROSSING pair - exact zero
+    /// mutual (Neumann's dot product vanishes pointwise) - never the
+    /// self inductance. Pins the 2026-10-20 diagonal fix.
+    #[test]
+    fn same_layer_perpendicular_family_carries_no_diagonal_self() {
+        let mut filaments = vec![
+            bar([0.0, 0.0, 0.0], [LENGTH, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            bar(
+                [2.0 * PITCH, -LENGTH / 2.0, 0.0],
+                [2.0 * PITCH, LENGTH / 2.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ),
+        ];
+        // A spectator bar off to the side: the coordinate cloud needs a
+        // gap in some projection for the modal pitch (the crossing pair
+        // alone is a single point).
+        filaments.push(bar(
+            [0.0, LENGTH, 0.0],
+            [LENGTH, LENGTH, 0.0],
+            [0.0, 1.0, 0.0],
+        ));
+        let operator = LayerPairOperator::build(&filaments).expect("three-bar deck builds");
+        let got = operator.pair_value(0, 1).expect("crossing pair resolves");
+        assert_eq!(
+            got, 0.0,
+            "perpendicular pair at zero displacement must read exact zero, not self L"
+        );
+        let got = operator
+            .pair_value(1, 0)
+            .expect("reverse crossing pair resolves");
+        assert_eq!(got, 0.0, "reverse direction of the same crossing pair");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The v2 conv preconditioner core (slice 2b increment 2).
+//
+// The precond apply runs a fixed-count Richardson inner solve of the
+// matrix-free near model `A_near = M (R + j omega L_conv) M^T`:
+// - the matvec's L part is the layer-pair operator (per-family
+//   forward convolutions; in-layer AND cross-layer pour couplings),
+//   R rides the branch diagonal exactly, j omega the scaling;
+// - the smoother is the per-family Tikhonov inverse
+//   `conj(H) / (|H|^2 + eps)` over the complex kernel
+//   `r_agg * delta(d) + j omega * M(d)` - bounded gain at every
+//   frequency, so the inner solve cannot poison the outer GMRES
+//   (failmode-2 guard);
+// - the via-tab blocks and the branch-CSR spine are RESERVED slots,
+//   empty in this increment (booked as 2c/2d): couplings they would
+//   carry are simply absent from the model - the answer stays
+//   operator-exact (GMRES referee), only precond quality is dimmed.
+// ---------------------------------------------------------------------------
+
+/// One (layer pair, axis family) population pair of the smoother.
+pub struct ConvPrecond {
+    operator: LayerPairOperator,
+    /// `inverses[li][lj][src_axis][dst_axis]`: the damped spectral
+    /// inverse of the family's complex kernel; `None` where either
+    /// population is empty.
+    inverses: Vec<Vec<[[Option<ConvKernel>; 2]; 2]>>,
+}
+
+impl ConvPrecond {
+    /// Builds the model: the layer-pair operator (omega-independent)
+    /// plus this frequency's per-family inverse kernels. Per-family
+    /// diagonal resistance rides the same-layer kernel's zero
+    /// displacement as the population's mean branch resistance.
+    pub fn build(
+        filaments: &[Filament],
+        resistances: &[f64],
+        omega: f64,
+        damp: f64,
+    ) -> Result<Self, KernelError> {
+        assert_eq!(
+            filaments.len(),
+            resistances.len(),
+            "one resistance per branch"
+        );
+        let operator = LayerPairOperator::build(filaments)?;
+        let layer_count = operator.layer_count();
+        let mut inverses: Vec<Vec<[[Option<ConvKernel>; 2]; 2]>> = Vec::with_capacity(layer_count);
+        for li in 0..layer_count {
+            let mut row: Vec<[[Option<ConvKernel>; 2]; 2]> = Vec::with_capacity(layer_count);
+            for lj in 0..layer_count {
+                let mut families: [[Option<ConvKernel>; 2]; 2] = Default::default();
+                for src_axis in 0..2 {
+                    let src_population = operator.population(li, src_axis);
+                    if src_population.is_empty() {
+                        continue;
+                    }
+                    for dst_axis in 0..2 {
+                        let dst_population = operator.population(lj, dst_axis);
+                        if dst_population.is_empty() {
+                            continue;
+                        }
+                        let kernel = sample_inverse_kernel(
+                            filaments,
+                            resistances,
+                            src_population,
+                            dst_population,
+                            src_axis,
+                            dst_axis,
+                            li == lj,
+                            omega,
+                            operator.raster(),
+                            operator.pitch(),
+                            damp,
+                        )?;
+                        families[src_axis][dst_axis] = Some(kernel);
+                    }
+                }
+                row.push(families);
+            }
+            inverses.push(row);
+        }
+        Ok(Self { operator, inverses })
+    }
+
+    /// The near-model branch drops: `R * current + j omega * L_conv *
+    /// current`, per branch (the caller lifts through the mesh).
+    pub fn near_drops(
+        &self,
+        currents: &[Complex64],
+        resistances: &[f64],
+        omega: f64,
+    ) -> Vec<Complex64> {
+        let count = currents.len();
+        let re: Vec<f64> = currents.iter().map(|c| c.re).collect();
+        let im: Vec<f64> = currents.iter().map(|c| c.im).collect();
+        let mut flux_re = vec![0.0; count];
+        let mut flux_im = vec![0.0; count];
+        self.operator.apply(&re, &mut flux_re);
+        self.operator.apply(&im, &mut flux_im);
+        (0..count)
+            .map(|b| {
+                let r = resistances[b];
+                Complex64::new(
+                    r * re[b] - omega * flux_im[b],
+                    r * im[b] + omega * flux_re[b],
+                )
+            })
+            .collect()
+    }
+
+    /// The smoother: branch correction = un-raster of the per-family
+    /// Tikhonov inverses applied to the rastered branch residual. The
+    /// residual vector is flux-like (loop residual lifted by the
+    /// mesh transpose at the caller).
+    pub fn smooth(&self, residual: &[Complex64]) -> Vec<Complex64> {
+        assert_eq!(
+            residual.len(),
+            self.operator.branch_count(),
+            "residual per branch"
+        );
+        let n = self.operator.raster();
+        let n2 = n * n;
+        let mut correction = vec![Complex64::new(0.0, 0.0); residual.len()];
+        for lj in 0..self.operator.layer_count() {
+            for dst_axis in 0..2 {
+                let dst_population = self.operator.population(lj, dst_axis);
+                if dst_population.is_empty() {
+                    continue;
+                }
+                // Raster this destination population's signed
+                // residual once, then reuse across source families.
+                let mut field = vec![Complex64::new(0.0, 0.0); n2];
+                for &(branch, _) in dst_population {
+                    let placed = self
+                        .operator
+                        .placement(branch)
+                        .expect("populated branch placed");
+                    field[placed.cell] += Complex64::new(
+                        placed.sign * residual[branch].re,
+                        placed.sign * residual[branch].im,
+                    );
+                }
+                for li in 0..self.operator.layer_count() {
+                    for src_axis in 0..2 {
+                        let Some(kernel) = &self.inverses[li][lj][src_axis][dst_axis] else {
+                            continue;
+                        };
+                        let src_population = self.operator.population(li, src_axis);
+                        let mut worked = field.clone();
+                        kernel.apply(&mut worked);
+                        for &(branch, _) in src_population {
+                            let placed = self
+                                .operator
+                                .placement(branch)
+                                .expect("populated branch placed");
+                            correction[branch] += Complex64::new(
+                                placed.sign * worked[placed.cell].re,
+                                placed.sign * worked[placed.cell].im,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        correction
+    }
+
+    /// Test-facing: the raster side.
+    pub fn raster(&self) -> usize {
+        self.operator.raster()
+    }
+}
+
+/// Samples one family's INVERSE kernel: the complex kernel
+/// `r_agg * delta(d) + j omega * M(d)` on the median-geometry
+/// representatives, damped-spectral-inverted. The diagonal
+/// resistance rides the same-layer zero displacement as the source
+/// population's mean branch resistance.
+#[allow(clippy::too_many_arguments)]
+fn sample_inverse_kernel(
+    filaments: &[Filament],
+    resistances: &[f64],
+    source_population: &[(usize, f64)],
+    victim_population: &[(usize, f64)],
+    src_axis: usize,
+    dst_axis: usize,
+    same_layer: bool,
+    omega: f64,
+    n: usize,
+    cell_m: f64,
+    damp: f64,
+) -> Result<ConvKernel, KernelError> {
+    let r_agg = source_population
+        .iter()
+        .map(|&(b, _)| resistances[b])
+        .sum::<f64>()
+        / source_population.len() as f64;
+    let src_segment = representative_segment(filaments, source_population, src_axis);
+    let dst_segment = representative_segment(filaments, victim_population, dst_axis);
+    let src = Filament::new(&src_segment).expect("representative segment is well-formed");
+    let dst_centre = dst_segment.center();
+    let (dst_a, dst_b) = (dst_segment.a.position(), dst_segment.b.position());
+    let (width, height, sigma, width_dir) = (
+        dst_segment.width,
+        dst_segment.height,
+        dst_segment.sigma,
+        dst_segment.width_dir,
+    );
+    Ok(ConvKernel::build_complex(
+        n,
+        cell_m,
+        |dx, dy| {
+            if same_layer && src_axis == dst_axis && dx == 0.0 && dy == 0.0 {
+                return Complex64::new(r_agg, omega * inductance::self_inductance(&src));
+            }
+            let offset = Vector3::new(dx, dy, 0.0) - dst_centre;
+            let displaced = Segment::new(
+                Node::from([dst_a.x + offset.x, dst_a.y + offset.y, dst_a.z]),
+                Node::from([dst_b.x + offset.x, dst_b.y + offset.y, dst_b.z]),
+                width,
+                height,
+                sigma,
+            )
+            .with_width_dir(width_dir.expect("representative carries an explicit width direction"));
+            let victim = Filament::new(&displaced).expect("displaced segment is well-formed");
+            let mutual = inductance::mutual_inductance(&src, &victim)
+                .expect("kernel-sample pair has aligned cross-sections by construction");
+            Complex64::new(0.0, omega * mutual)
+        },
+        damp,
+    ))
 }
