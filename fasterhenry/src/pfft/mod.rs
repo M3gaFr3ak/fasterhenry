@@ -407,29 +407,46 @@ impl PfftOperator {
         }
         // Memory census before any big allocation. The FFT half is
         // deterministic from the dims (grid.len() and `padded` are already
-        // exact); the near-field half is an estimate - pair counts depend on
-        // geometry, not only on parameters - calibrated as
-        // `pairs_per_filament ~ 35 x k^3 / cpf^1.5` from the 40k-filament
-        // fixture's measured 799 pairs/branch at k = 8, cpf = 8. The exact
-        // count is printed after `near_pairs` returns. When
-        // FASTERHENRY_MEMORY_BUDGET_GB is set, the estimate exceeding the
-        // budget refuses HERE, before the allocations, instead of dying by
-        // the OOM daemon mid-run.
+        // exact).
         let fft_bytes = 3 * padded * 16;
-        let cpf_nominal = match params.grid_spacing {
-            GridSpacing::Auto { cells_per_filament } => cells_per_filament,
-            GridSpacing::Fixed(_) => grid.len() as f64 / n as f64,
-        };
-        // ~24 B/pair (directed pair index + precorrect scratch headroom).
-        let pairs_per_fil = 35.0 * params.near_field_radius.powi(3) / cpf_nominal.powf(1.5);
-        let pairs_estimate = pairs_per_fil * n as f64;
-        let pairs_bytes = 24.0 * pairs_estimate;
         let fft_gb = fft_bytes as f64 / 1e9;
-        let pairs_gb = pairs_bytes / 1e9;
+        eprintln!(
+            "pfft: census: grid {:?}, padded {} pts, FFT ~{:.1} GB (3 x {:.1} GB spectra)",
+            grid.dims,
+            padded,
+            fft_gb,
+            fft_gb / 3.0,
+        );
+        // **[superseded 2026-10-20, ekart A/B lane - the whole
+        // fixture-calibrated near-pair extrapolation
+        // `pairs_per_fil ~ 35 x k^3 / cpf^1.5` never read the deck
+        // (no volume, no density, no aspect); safe for its own
+        // constant-density cloud generator, untrustworthy beyond it
+        // (orders wrong either way on slab/pancake decks). The gate
+        // below refuses on the TRUE directed-pair count instead
+        // (near_pairs_count, O(n) memory, the near walk's bin
+        // structure listed without materializing).]**
+        // The census's near-field half: the TRUE directed-pair count
+        // (the near walk's bin structure listed without materializing;
+        // O(n) memory). Computed here so the budget gate refuses on
+        // truth before the (potentially enormous) pair+scratch
+        // allocations - the same mid-run refusal policy the OOM
+        // governor enforces, moved to pre-flight where it is honest.
+        let radius = params.near_field_radius * spacing;
+        let near_rows = near::near_pairs_count(filaments, radius);
+        let pairs_est: usize = near_rows.iter().map(|&c| c as usize).sum();
+        let pairs_bytes = 24usize.saturating_mul(pairs_est);
+        let pairs_gb = pairs_bytes as f64 / 1e9;
         let census_gb = fft_gb + pairs_gb;
         eprintln!(
-            "pfft: census: grid {:?}, padded {} pts, FFT ~{:.1} GB (3 x {:.1} GB spectra) + near pairs ~{:.1} GB (est {:.3e} pairs; fixture-calibrated, +-3x) = ~{:.1} GB",
-            grid.dims, padded, fft_gb, fft_gb / 3.0, pairs_gb, pairs_estimate, census_gb,
+            "pfft: near-field census: {} rows, {} directed pairs, exact ({:.1} GB at 24 B/parn)",
+            near_rows.len(),
+            pairs_est,
+            pairs_gb,
+        );
+        eprintln!(
+            "pfft: census total: grid {:?}, padded {} pts, FFT ~{:.1} GB + near pairs ~{:.1} GB = ~{:.1} GB",
+            grid.dims, padded, fft_gb, pairs_gb, census_gb,
         );
         if let Ok(budget) = std::env::var("FASTERHENRY_MEMORY_BUDGET_GB") {
             let budget: f64 = budget.trim().parse::<f64>().map_err(|_| {
@@ -442,18 +459,25 @@ impl PfftOperator {
                     "FASTERHENRY_MEMORY_BUDGET_GB must be a finite number of GB",
                 ));
             }
+            let override_set = std::env::var("FASTERHENRY_CENSUS_OVERRIDE")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false);
             if census_gb > budget {
-                return Err(PfftError::MemoryBudget {
-                    estimate_gb: census_gb,
-                    budget_gb: budget,
-                    fft_gb,
-                    pairs_gb,
-                    pairs_est: pairs_estimate,
-                });
+                if override_set {
+                    eprintln!(
+                        "conv: warning: FASTERHENRY_CENSUS_OVERRIDE=1: the census total ~{census_gb:.1} GB exceeds the FASTERHENRY_MEMORY_BUDGET_GB={budget:.1} GB budget - proceeding anyway on explicit override; the runtime governor still refuses at the wall (exit 134) and this row carries the caveat on record (the count is exact, not fixture-extrapolated).",
+                    );
+                } else {
+                    return Err(PfftError::MemoryBudget {
+                        estimate_gb: census_gb,
+                        budget_gb: budget,
+                        fft_gb,
+                        pairs_gb,
+                        pairs_est: pairs_est as f64,
+                    });
+                }
             }
         }
-        let radius = params.near_field_radius * spacing;
-
         eprintln!("pfft: projecting {} filaments to the grid ...", n);
         let projections = grid::project_all(&grid, filaments, radius);
         eprintln!("pfft: enumerating near-field pairs ...");

@@ -48,6 +48,27 @@ pub(crate) fn near_pairs(filaments: &[Filament], radius: f64) -> Vec<Vec<u32>> {
         .collect()
 }
 
+/// The COUNT half of `near_pairs`: per filament the number of neighbors
+/// (`j >= index`, self included), no partner materialization. The
+/// pre-flight census in `PfftOperator::new` refuses on this true count
+/// (O(n) memory) instead of the fixture-calibrated extrapolation - the
+/// extrapolation is blind to the deck's density and box aspect and can
+/// miss by factors of ~10 either way on slab/pancake decks (reports a
+/// report: conv-invc4's ekart lane burned four rows on its printout
+/// before the discrepancy was pulled apart). The near walk itself then
+/// re-budgets quantitatively: the binning build (~5% of set-up per the
+/// module doc) is paid twice for the posture's worth.
+pub(crate) fn near_pairs_count(filaments: &[Filament], radius: f64) -> Vec<u32> {
+    let structure = NearBins::build(filaments, radius);
+    (0..structure.bars.len())
+        .into_par_iter()
+        .map(|index| {
+            let list = structure.candidates_for(index, true);
+            list.len() as u32
+        })
+        .collect()
+}
+
 /// The same scan restricted to QUERIED branch indices: for each
 /// wanted filament, every filament (either direction, self excluded)
 /// within `radius`, ascending. The spatial pFFT chassis is shared so
