@@ -14,6 +14,7 @@ pub use problem::Problem;
 
 use std::path::Path;
 
+use fasterhenry::pfft::GridSpacing;
 use fasterhenry::{
     IterativeParams, IterativeSystem, MeshSystem, Solver, SolverChoice, SweepResult,
 };
@@ -112,6 +113,14 @@ pub fn run_reporting(
 /// ([`IterativeSystem`]) above it — see [`solver_for`]. The iterative path
 /// reports no coupling-truncation warnings because it does not truncate:
 /// its warning list is always empty.
+///
+/// The pFFT's grid density reads `FASTERHENRY_PFFT_CPF` (cells per
+/// filament, in metres-of-h terms: lower is a coarser far-field grid).
+/// Accuracy at a fixed near-field radius does not depend on it (the
+/// [`pfft` module documentation](fasterhenry::pfft) table), but the FFT
+/// volume does, so boards whose padded grid would exceed
+/// [`fasterhenry::pfft::MAX_FFT_POINTS`] use it to fit. A malformed or
+/// non-positive value is a hard error, never a silent default.
 pub fn run_reporting_with(
     problem: &Problem,
     frequency_override: Option<Vec<f64>>,
@@ -128,11 +137,17 @@ pub fn run_reporting_with(
         return Err("no ports: give .external in the deck or ports in the document".to_string());
     }
     if solver_for(problem, choice)? == Solver::Iterative {
+        let mut params = IterativeParams::default();
+        if let Some(cells) = pfft_cpf_from_env()? {
+            params.pfft.grid_spacing = GridSpacing::Auto {
+                cells_per_filament: cells,
+            };
+        }
         let system = IterativeSystem::assemble(
             &problem.geometry,
             &problem.ports,
             &problem.discretization,
-            &IterativeParams::default(),
+            &params,
         )
         .map_err(|error| error.to_string())?;
         let result = system
@@ -156,6 +171,27 @@ pub fn run_reporting_with(
         .sweep(&frequencies)
         .map_err(|error| error.to_string())?;
     Ok((result, warnings))
+}
+
+/// The pFFT grid density from the environment, or `None` for the library
+/// default (`8.0` cells per filament). A value that does not parse, is
+/// non-positive or non-finite is a hard error: a silent fall-back would
+/// swap a memory-fit board onto a grid the operator then rejects anyway,
+/// and would do so invisibly.
+fn pfft_cpf_from_env() -> Result<Option<f64>, String> {
+    let Ok(text) = std::env::var("FASTERHENRY_PFFT_CPF") else {
+        return Ok(None);
+    };
+    let parsed: f64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("FASTERHENRY_PFFT_CPF: not a number: {text:?}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!(
+            "FASTERHENRY_PFFT_CPF: must be a positive finite number of cells per filament, got {text:?}"
+        ));
+    }
+    Ok(Some(parsed))
 }
 
 #[cfg(test)]

@@ -121,6 +121,33 @@ fn random_sets_match_the_dense_product_at_several_scales() {
     }
 }
 
+/// Accuracy holds in the coarse far-grid regime the CLI's
+/// `FASTERHENRY_PFFT_CPF` knob enables: the module documentation's
+/// measured claim that, at a fixed near-field radius (in cells, so
+/// `k x h` scales with `h`), the norm-wise error does not depend on the
+/// grid density. The knob drops `cells_per_filament` to fit boards such
+/// as the ekart deck under `MAX_FFT_POINTS`; this test keeps the regime
+/// inside the documented tolerance.
+#[test]
+fn the_coarse_grid_regime_stays_accurate() {
+    for cells in [0.25, 1.0] {
+        let params = PfftParams {
+            grid_spacing: GridSpacing::Auto {
+                cells_per_filament: cells,
+            },
+            ..PfftParams::default()
+        };
+        for (n, seed) in [(200, 2), (500, 3)] {
+            let side = 10e-3 * (n as f64 / 400.0).cbrt();
+            for manhattan in [true, false] {
+                let filaments = random_set(n, side, manhattan, seed);
+                let what = if manhattan { "manhattan" } else { "skew" };
+                assert_accurate(&format!("{what} n={n} cells={cells}"), &filaments, &params);
+            }
+        }
+    }
+}
+
 #[test]
 fn most_pairs_of_a_large_random_set_take_the_fft_path() {
     // Guards against the accuracy tests passing only because everything is
@@ -457,7 +484,7 @@ fn parameter_study() {
         let dense = partial_inductance_matrix(&filaments).unwrap();
         let reference = &dense * DVector::from_column_slice(&x);
         println!("manhattan = {manhattan}, n = {n}");
-        for cells in [4.0, 8.0, 16.0] {
+        for cells in [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0] {
             for radius in [4.0, 6.0, 8.0] {
                 for order in [2, 3, 4, 5] {
                     if radius < (order + 1) as f64 {
