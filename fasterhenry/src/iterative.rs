@@ -682,6 +682,36 @@ impl ConvCore {
         let tab_bin_m = parse_env_m("FASTERHENRY_CENSUS_VIA_BIN_M")
             .or_else(|| parse_env_m("FASTERHENRY_CENSUS_RADIUS_M"))
             .unwrap_or_else(|| crate::census::derived_radius(&system.filaments));
+        // Spine chassis (2d): FASTERHENRY_CONV_SPINE=both|matvec|off
+        // (default both), damped Jacobi damping
+        // FASTERHENRY_CONV_SPINE_DAMP in (0, 1], default 0.5.
+        let spine_composition = match std::env::var("FASTERHENRY_CONV_SPINE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("both") => TabComposition::Both,
+            Some("matvec") => TabComposition::Matvec,
+            Some("off") => TabComposition::Off,
+            Some(other) => {
+                eprintln!(
+                    "conv: warning: FASTERHENRY_CONV_SPINE={other:?} not |both|matvec|off; using both"
+                );
+                TabComposition::Both
+            }
+        };
+        let spine_damp: f64 = std::env::var("FASTERHENRY_CONV_SPINE_DAMP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.5);
+        let spine_damp = if spine_damp.is_finite() && spine_damp > 0.0 && spine_damp <= 1.0 {
+            spine_damp
+        } else {
+            eprintln!(
+                "conv: warning: FASTERHENRY_CONV_SPINE_DAMP={spine_damp} outside (0, 1]; using 0.5"
+            );
+            0.5
+        };
         let core = ConvPrecond::build(
             &system.filaments,
             &system.resistances,
@@ -690,6 +720,8 @@ impl ConvCore {
             composition,
             tab_bin_m,
             tab_pour,
+            spine_composition,
+            spine_damp,
         )
         .map_err(SolveError::from)?;
         Ok(Self {

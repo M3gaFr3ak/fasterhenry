@@ -167,3 +167,36 @@ fn tab_compositions_never_change_the_answer() {
     std::env::remove_var("FASTERHENRY_CONV_TABS");
     std::env::remove_var("FASTERHENRY_PRECOND");
 }
+
+#[test]
+fn spine_compositions_never_change_the_answer() {
+    // Same discipline as the tab knob: the spine's composition may
+    // move iterations, never the answer - the GMRES referee sees the
+    // true operator.
+    for mode in ["both", "matvec", "off"] {
+        std::env::set_var("FASTERHENRY_PRECOND", "conv");
+        std::env::set_var("FASTERHENRY_CONV_SPINE", mode);
+        let (geometry, ports, discretization) = three_layer_structure();
+        let dense = MeshSystem::assemble(&geometry, &ports, &discretization).unwrap();
+        let iterative = IterativeSystem::assemble(
+            &geometry,
+            &ports,
+            &discretization,
+            &IterativeParams::default(),
+        )
+        .unwrap();
+        let expected = dense.impedance(1.0e3).unwrap();
+        let solution = iterative.solve(1.0e3).unwrap();
+        let difference = (solution.impedance.clone() - &expected).norm() / expected.norm();
+        println!("conv spine={mode} at 1e3 Hz: difference {difference:e}");
+        assert!(
+            difference < 1.0e-4,
+            "conv {mode} at 1e3 Hz: iterative and dense differ by {difference:e}"
+        );
+        for (port_i, outcome) in solution.gmres.iter().enumerate() {
+            assert!(outcome.converged, "conv {mode} port {port_i}: {outcome:?}");
+        }
+    }
+    std::env::remove_var("FASTERHENRY_CONV_SPINE");
+    std::env::remove_var("FASTERHENRY_PRECOND");
+}

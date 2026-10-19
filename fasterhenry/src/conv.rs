@@ -1030,6 +1030,93 @@ mod layer_pair_tests {
     }
 
     #[test]
+    fn spine_carries_block_free_via_pairs_only() {
+        // Two separate patches: vias at the (0,0) and (3,0) census
+        // cells (4-connected flood fill keeps them apart at a 1 mm
+        // bin), pours scattered around them. The spine's slot rows
+        // must carry only the block-free pairs - via-to-pour partners
+        // whose centre cell does not belong to the via's own patch;
+        // same-patch pairs live in the block, spills stay conv-borne.
+        let mut filaments = Vec::new();
+        for i in 0..6 {
+            filaments.push(bar(
+                [0.0, i as f64 * PITCH, 0.0],
+                [LENGTH, i as f64 * PITCH, 0.0],
+                [0.0, 1.0, 0.0],
+            ));
+        }
+        // Branch 6: a y-pour whose line passes through via A's cell
+        // but whose centre is centred at (0.5, 2.5) mm.
+        filaments.push(bar(
+            [0.5 * PITCH, 0.5 * PITCH, 0.0],
+            [0.5 * PITCH, LENGTH, 0.0],
+            [1.0, 0.0, 0.0],
+        ));
+        // Branch 7: an x-pour passing below via B too, centre
+        // (2.0, 0.5) mm.
+        filaments.push(bar(
+            [0.0, 0.5 * PITCH, 0.0],
+            [LENGTH, 0.5 * PITCH, 0.0],
+            [0.0, 1.0, 0.0],
+        ));
+        // Branches 8 and 9: the two vias.
+        filaments.push(bar(
+            [0.5 * PITCH, 0.5 * PITCH, 0.0],
+            [0.5 * PITCH, 0.5 * PITCH, 1.5e-3],
+            [1.0, 0.0, 0.0],
+        ));
+        filaments.push(bar(
+            [3.5 * PITCH, 0.5 * PITCH, 0.0],
+            [3.5 * PITCH, 0.5 * PITCH, 1.5e-3],
+            [1.0, 0.0, 0.0],
+        ));
+        let resistances = vec![1.0e-6; filaments.len()];
+        let omega = std::f64::consts::TAU * 1.0e3;
+        let spine = ConvPrecond::build_spine(
+            &filaments,
+            &resistances,
+            omega,
+            TabComposition::Both,
+            PITCH,
+            true,
+        )
+        .expect("two-patch deck builds a spine");
+        let spine = spine.expect("a deck with vias carries a spine");
+        assert_eq!(spine.vias, vec![8usize, 9]);
+        assert_eq!(
+            spine.jacobi.len(),
+            2,
+            "the Both composition carries the Jacobi denominators"
+        );
+        let partners = |slot: usize| {
+            let lo = spine.row_ptr[slot] as usize;
+            let hi = spine.row_ptr[slot + 1] as usize;
+            spine.col[lo..hi].to_vec()
+        };
+        // Slot 0 (via A): the pours of its own patch's cells are
+        // blocked... none - br 6 and 7 have centres OFF the patch's
+        // cells, br 0/1's are at (2,0)/(2,1): all four partners.
+        assert_eq!(partners(0), vec![0u32, 1, 6, 7]);
+        // Slot 1 (via B): 0/1 (dx zero within the pour line), 7
+        // (passes through); not 6 (3 mm away) and not a via-via pair
+        // (3 mm exceeds the bin radius).
+        assert_eq!(partners(1), vec![0u32, 1, 7]);
+        for (slot, &via) in spine.vias.iter().enumerate() {
+            let lo = spine.row_ptr[slot] as usize;
+            let hi = spine.row_ptr[slot + 1] as usize;
+            for (index, &partner) in spine.col[lo..hi].iter().enumerate() {
+                let expected =
+                    inductance::mutual_inductance(&filaments[via], &filaments[partner as usize])
+                        .expect("spine pair admits the exact kernel");
+                assert!(
+                    (spine.values[lo + index] - expected).abs() < 1.0e-15,
+                    "spine entry ({via},{partner}) must be the exact mutual"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn layer_pair_operator_matches_exact_mutuals_on_a_uniform_deck() {
         let filaments = deck();
         let operator = LayerPairOperator::build(&filaments).expect("uniform deck builds");
@@ -1164,6 +1251,11 @@ pub struct ConvPrecond {
     /// The explicit census-patch tab blocks (v2 slice 2c); empty
     /// under the `Off` composition.
     tabs: Vec<TabBlock>,
+    /// The branch-CSR cross spine (v2 slice 2d); `None` under `Off`.
+    spine: Option<SpineCsr>,
+    /// The spine's Jacobi damping (the `Both` composition's stage;
+    /// ignored when the LU stage list is empty).
+    spine_damp: f64,
 }
 
 impl ConvPrecond {
@@ -1188,6 +1280,8 @@ impl ConvPrecond {
         composition: TabComposition,
         tab_bin_m: f64,
         tab_pour: bool,
+        spine_composition: TabComposition,
+        spine_damp: f64,
     ) -> Result<Self, KernelError> {
         assert_eq!(
             filaments.len(),
@@ -1239,13 +1333,22 @@ impl ConvPrecond {
             tab_bin_m,
             tab_pour,
         )?;
+        let spine = Self::build_spine(
+            filaments,
+            resistances,
+            omega,
+            spine_composition,
+            tab_bin_m,
+            tab_pour,
+        )?;
         Ok(Self {
             operator,
             inverses,
             tabs,
+            spine,
+            spine_damp,
         })
     }
-
     /// The explicit per-patch blocks: member branches from the
     /// census's flood fill, exact dense mutuals among them, LU
     /// factored when the smoother composition is live.
@@ -1286,6 +1389,111 @@ impl ConvPrecond {
         Ok(blocks)
     }
 
+    /// The branch-CSR cross spine (2d): the near-field couplings no
+    /// other near-model stage carries - pairs with a via/tab-member
+    /// endpoint and NOT both inside one patch's block. Pour-pour stays
+    /// conv-borne even across patches; same-patch pairs stay in the
+    /// block. CSR rows over branch indices, entries exact mutual L;
+    /// the damped Jacobi denominators ride only the via rows.
+    fn build_spine(
+        filaments: &[Filament],
+        resistances: &[f64],
+        omega: f64,
+        composition: TabComposition,
+        tab_bin_m: f64,
+        tab_pour: bool,
+    ) -> Result<Option<SpineCsr>, KernelError> {
+        if composition == TabComposition::Off {
+            return Ok(None);
+        }
+        let membership = crate::census::via_patch_membership(filaments, tab_bin_m, tab_pour);
+        let vias: Vec<usize> = membership
+            .members
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|b| {
+                membership.patch_of_branch[*b].is_some()
+                    && filaments[*b].direction().z.abs() >= crate::census::VIA_IS_Z
+            })
+            .collect();
+        if vias.is_empty() {
+            return Ok(None);
+        }
+        // Spine radius = the via census bin, falling to the deck's
+        // derived first guess when the bin is degenerate: the engine
+        // lever (a CONV_SPINE radius knob) prices at the first ekart
+        // row.
+        let radius = if tab_bin_m.is_finite() && tab_bin_m > 0.0 {
+            tab_bin_m
+        } else {
+            crate::census::derived_radius(filaments)
+        };
+        let all = crate::pfft::near_pairs_wanted(filaments, radius, &vias);
+        // Slot-indexed entries: for via slot s, its partner list (any
+        // deck branch unless same-patch). The flux apply scatters BOTH
+        // directions per pair (mutuals are symmetric), so only the via
+        // side is stored.
+        let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
+        for (&via, list) in vias.iter().zip(&all) {
+            let mut row: Vec<(u32, f64)> = Vec::new();
+            for &partner in list {
+                let partner = partner as usize;
+                if partner == via {
+                    continue;
+                }
+                let src_patch = membership.patch_of_branch[via];
+                if src_patch.is_some() && src_patch == membership.patch_of_branch[partner] {
+                    continue;
+                }
+                // Canonical per pair: a partner that is itself a via
+                // (in some patch) emits from its own slot when it is
+                // the lower endpoint; a pour partner has no slot, so
+                // the pair only exists here.
+                if membership.patch_of_branch[partner].is_some() && partner < via {
+                    continue;
+                }
+                let mutual = inductance::mutual_inductance(&filaments[via], &filaments[partner])?;
+                row.push((partner as u32, mutual));
+            }
+            row.sort_by_key(|&(p, _)| p);
+            slot_rows.push(row);
+        }
+        let mut row_ptr: Vec<u32> = Vec::with_capacity(vias.len() + 1);
+        row_ptr.push(0u32);
+        let mut col: Vec<u32> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        for row in slot_rows.iter() {
+            for &(partner, mutual) in row.iter() {
+                col.push(partner);
+                values.push(mutual);
+            }
+            row_ptr.push(col.len() as u32);
+        }
+        let jacobi = if composition == TabComposition::Both {
+            slot_rows
+                .iter()
+                .zip(&vias)
+                .map(|(row, &b)| {
+                    let row_sum: f64 = row.iter().map(|&(_, m)| m.abs()).sum();
+                    C64::new(
+                        resistances[b],
+                        omega * (row_sum + inductance::self_inductance(&filaments[b])),
+                    )
+                })
+                .collect::<Vec<C64>>()
+        } else {
+            Vec::new()
+        };
+        Ok(Some(SpineCsr {
+            row_ptr,
+            col,
+            values,
+            jacobi,
+            vias,
+        }))
+    }
+
     /// The near-model branch drops: `R * current + j omega * L_conv *
     /// current`, per branch (the caller lifts through the mesh).
     pub fn near_drops(
@@ -1306,6 +1514,11 @@ impl ConvPrecond {
         // live here, never in the kernels.
         for tab in &self.tabs {
             tab.flux(currents, &mut flux_re, &mut flux_im);
+        }
+        // The cross spine: both directions of every block-free via
+        // pair; same no-kernels discipline as the tab blocks.
+        if let Some(spine) = &self.spine {
+            spine.flux(currents, &mut flux_re, &mut flux_im);
         }
         (0..count)
             .map(|b| {
@@ -1378,6 +1591,11 @@ impl ConvPrecond {
         // is absent).
         for tab in &self.tabs {
             tab.solve(residual, &mut correction);
+        }
+        // The spine's damped Jacobi over the via rows (a no-op when
+        // no denominators exist).
+        if let Some(spine) = &self.spine {
+            spine.smooth_jacobi(residual, &mut correction, self.spine_damp);
         }
         correction
     }
@@ -1547,6 +1765,67 @@ impl TabBlock {
         }
         for (slot, &member) in self.members.iter().enumerate() {
             correction[member] += z[slot];
+        }
+    }
+}
+
+/// The branch-CSR cross spine (2d): the near-field couplings no other
+/// near-model stage carries (pairs with a via endpoint, partners
+/// outside their patch block). Only the via side of each pair is
+/// stored (slot-indexed CSR); the flux apply scatters both directions
+/// since mutuals are symmetric. The `Both` composition's smoother
+/// stage is a damped Jacobi pass over the via rows, denominators the
+/// branch's own near-model diagonal `R + j omega L_self` (real parts
+/// in the re side, bounded gain, fixed per frequency).
+pub struct SpineCsr {
+    /// Slot (via) row boundaries over `col`/`values`, length
+    /// `vias.len() + 1`.
+    row_ptr: Vec<u32>,
+    col: Vec<u32>,
+    values: Vec<f64>,
+    /// Per slot the Jacobi denominator; empty under `Matvec`.
+    jacobi: Vec<C64>,
+    /// The slot's branch index (ascending deck order).
+    vias: Vec<usize>,
+}
+
+impl SpineCsr {
+    /// The spine's flux contribution: for via slot `s`, both directions
+    /// of every stored pair (via's flux takes the partner's current and
+    /// vice versa).
+    fn flux(&self, currents: &[C64], flux_re: &mut [f64], flux_im: &mut [f64]) {
+        if self.vias.is_empty() {
+            return;
+        }
+        for (slot, &via) in self.vias.iter().enumerate() {
+            let lo = self.row_ptr[slot] as usize;
+            let hi = self.row_ptr[slot + 1] as usize;
+            let mut sum_re = 0.0f64;
+            let mut sum_im = 0.0f64;
+            for (index, &partner) in self.col[lo..hi].iter().enumerate() {
+                let mutual = self.values[lo + index];
+                sum_re += mutual * currents[partner as usize].re;
+                sum_im += mutual * currents[partner as usize].im;
+                // The transpose side (the via's current drops on the
+                // partner).
+                let transpose_re = mutual * currents[via].re;
+                let transpose_im = mutual * currents[via].im;
+                flux_re[partner as usize] += transpose_re;
+                flux_im[partner as usize] += transpose_im;
+            }
+            flux_re[via] += sum_re;
+            flux_im[via] += sum_im;
+        }
+    }
+
+    /// The damped Jacobi smoother stage over the via rows:
+    /// `correction[vias[s]] += residual[vias[s]] / denominators[s]`.
+    fn smooth_jacobi(&self, residual: &[C64], correction: &mut [C64], damp: f64) {
+        if self.jacobi.is_empty() {
+            return;
+        }
+        for (slot, &via) in self.vias.iter().enumerate() {
+            correction[via] += residual[via] * damp / self.jacobi[slot];
         }
     }
 }

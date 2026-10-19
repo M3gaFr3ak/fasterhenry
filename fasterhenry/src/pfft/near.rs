@@ -36,76 +36,155 @@ fn bounds(bar: &Bar) -> (Vector3<f64>, Vector3<f64>) {
     (bar.centre - reach, bar.centre + reach)
 }
 
-/// For each filament `i`, the filaments `j ≥ i` (including `i` itself)
-/// within `radius` of it, ascending.
+/// For each filament `i`, the filaments `j >= i` (including `i`
+/// itself) within `radius` of it, ascending. Semantics unchanged by
+/// the `NearBins` code motion: the candidate scan, the j >= i
+/// filter, and the separation retention all moved verbatim.
 pub(crate) fn near_pairs(filaments: &[Filament], radius: f64) -> Vec<Vec<u32>> {
-    let n = filaments.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let bars: Vec<Bar> = filaments.iter().map(Bar::new).collect();
-    let boxes: Vec<_> = bars.iter().map(bounds).collect();
-    let mut lo = boxes[0].0;
-    let mut hi = boxes[0].1;
-    for (a, b) in &boxes {
-        lo = lo.inf(a);
-        hi = hi.sup(b);
-    }
-    // Uniform bins about the radius in size, coarsened if that would make
-    // far more bins than filaments.
-    let extent = hi - lo;
-    let mut size = radius.max(extent.max() * 1e-9).max(f64::MIN_POSITIVE);
-    let bin_dims = |size: f64| extent.map(|e| (e / size).floor() as usize + 1);
-    while bin_dims(size).iter().product::<usize>() > 8 * n + 64 {
-        size *= 1.5;
-    }
-    let dims = bin_dims(size);
-    let cell = |x: f64, axis: usize| {
-        (((x - lo[axis]) / size).floor().max(0.0) as usize).min(dims[axis] - 1)
-    };
-    let range = |a: &Vector3<f64>, b: &Vector3<f64>| {
-        let first = [cell(a.x, 0), cell(a.y, 1), cell(a.z, 2)];
-        let last = [cell(b.x, 0), cell(b.y, 1), cell(b.z, 2)];
-        (first, last)
-    };
-    let mut bins: Vec<Vec<u32>> = vec![Vec::new(); dims.iter().product()];
-    for (index, (a, b)) in boxes.iter().enumerate() {
-        let (first, last) = range(a, b);
-        for i in first[0]..=last[0] {
-            for j in first[1]..=last[1] {
-                for k in first[2]..=last[2] {
-                    bins[(i * dims[1] + j) * dims[2] + k].push(index as u32);
-                }
-            }
-        }
-    }
-    let grow = Vector3::repeat(radius);
-    (0..n)
+    let structure = NearBins::build(filaments, radius);
+    (0..structure.bars.len())
         .into_par_iter()
-        .map(|index| {
-            let (a, b) = &boxes[index];
-            let (first, last) = range(&(a - grow), &(b + grow));
-            let mut found = Vec::new();
+        .map(|index| structure.candidates_for(index, true))
+        .collect()
+}
+
+/// The same scan restricted to QUERIED branch indices: for each
+/// wanted filament, every filament (either direction, self excluded)
+/// within `radius`, ascending. The spatial pFFT chassis is shared so
+/// the wanted subset's partner set is exactly the all-index scan's
+/// partner set minus the upper-side indexing - `near_pairs_wanted ==
+/// near_pairs` where both define it (equivalence pinned in tests).
+pub(crate) fn near_pairs_wanted(
+    filaments: &[Filament],
+    radius: f64,
+    wanted: &[usize],
+) -> Vec<Vec<u32>> {
+    let structure = NearBins::build(filaments, radius);
+    wanted
+        .par_iter()
+        .map(|&index| structure.candidates_for(index, false))
+        .collect()
+}
+
+/// The shared spatial structure of the near-pair scan: uniform bins
+/// sized to the radius (coarsened when that would over-bin), each
+/// branch's bar placed in every bin its box touches.
+pub(crate) struct NearBins {
+    bars: Vec<Bar>,
+    dims: [usize; 3],
+    lo: Vector3<f64>,
+    size: f64,
+    radius: f64,
+    bins: Vec<Vec<u32>>,
+}
+
+impl NearBins {
+    fn build(filaments: &[Filament], radius: f64) -> Self {
+        let n = filaments.len();
+        let bars: Vec<Bar> = filaments.iter().map(Bar::new).collect();
+        let mut lo = match bars.first() {
+            Some(bar) => {
+                let (a, _) = bounds(bar);
+                a
+            }
+            None => Vector3::zeros(),
+        };
+        let mut hi = match bars.first() {
+            Some(bar) => {
+                let (_, b) = bounds(bar);
+                b
+            }
+            None => Vector3::zeros(),
+        };
+        let boxes: Vec<_> = bars.iter().map(bounds).collect();
+        for (a, b) in &boxes {
+            lo = lo.inf(a);
+            hi = hi.sup(b);
+        }
+        // Uniform bins about the radius in size, coarsened if that
+        // would make far more bins than filaments.
+        let extent = hi - lo;
+        let mut size = radius.max(extent.max() * 1e-9).max(f64::MIN_POSITIVE);
+        let bin_dims = |size: f64| extent.map(|e| (e / size).floor() as usize + 1);
+        while bin_dims(size).iter().product::<usize>() > 8 * n + 64 {
+            size *= 1.5;
+        }
+        let dims = bin_dims(size);
+        let dims = [dims[0], dims[1], dims[2]];
+        let cell = |x: f64, axis: usize| {
+            (((x - lo[axis]) / size).floor().max(0.0) as usize).min(dims[axis] - 1)
+        };
+        let mut bins: Vec<Vec<u32>> = vec![Vec::new(); dims.iter().product()];
+        for (index, (a, b)) in boxes.iter().enumerate() {
+            let first = [cell(a.x, 0), cell(a.y, 1), cell(a.z, 2)];
+            let last = [cell(b.x, 0), cell(b.y, 1), cell(b.z, 2)];
             for i in first[0]..=last[0] {
                 for j in first[1]..=last[1] {
                     for k in first[2]..=last[2] {
-                        found.extend(
-                            bins[(i * dims[1] + j) * dims[2] + k]
-                                .iter()
-                                .filter(|&&other| other as usize >= index),
-                        );
+                        bins[(i * dims[1] + j) * dims[2] + k].push(index as u32);
                     }
                 }
             }
-            found.sort_unstable();
-            found.dedup();
-            found.retain(|&other| {
-                let other = other as usize;
-                other == index || separation(&bars[index], &bars[other]) < radius
-            });
-            found
-        })
-        .collect()
+        }
+        Self {
+            bars,
+            dims,
+            lo,
+            size,
+            radius,
+            bins,
+        }
+    }
+
+    /// One branch's candidate list from the shared bins: the query
+    /// box grown by the scan RADIUS (the bin size is only the bin
+    /// pitch; coarsened bins can exceed it), ascending, deduped,
+    /// separated by real 3D distance. `upper_only` keeps the original
+    /// scan's j >= index with self included; `false` keeps every
+    /// direction (self excluded - the wanted variant's semantics).
+    fn candidates_for(&self, index: usize, upper_only: bool) -> Vec<u32> {
+        let (a, b) = bounds(&self.bars[index]);
+        let grow = Vector3::repeat(self.radius);
+        let cell = |x: f64, axis: usize| {
+            (((x - self.lo[axis]) / self.size).floor().max(0.0) as usize).min(self.dims[axis] - 1)
+        };
+        let first = [
+            cell((a - grow).x, 0),
+            cell((a - grow).y, 1),
+            cell((a - grow).z, 2),
+        ];
+        let last = [
+            cell((b + grow).x, 0),
+            cell((b + grow).y, 1),
+            cell((b + grow).z, 2),
+        ];
+        let mut found = Vec::new();
+        for i in first[0]..=last[0] {
+            for j in first[1]..=last[1] {
+                for k in first[2]..=last[2] {
+                    found.extend(
+                        self.bins[(i * self.dims[1] + j) * self.dims[2] + k]
+                            .iter()
+                            .filter(|&&other| {
+                                if upper_only {
+                                    other as usize >= index
+                                } else {
+                                    other as usize != index
+                                }
+                            }),
+                    );
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found.retain(|&other| {
+            let other = other as usize;
+            (other == index && upper_only)
+                || separation(&self.bars[index], &self.bars[other]) < self.radius
+        });
+        found
+    }
 }
 
 /// The grid kernel `1/|r_g − r_h|` for an integer offset, with the
@@ -634,5 +713,74 @@ mod profile {
             bbox_time + projection_time + near_pair_time + real_precorrect_time + fft_planning_time;
         eprintln!("  measured total (excl. final CSR arrays in PfftOperator::new) {measured_total:>10.2?}");
         eprintln!("  checksum (ignore): {checksum:e}");
+    }
+
+    /// The wanted-variant's partner set is exactly the all-index
+    /// scan's partner set restricted to the queried branch, either
+    /// direction, self removed - pins the NearBins code motion.
+    #[test]
+    fn near_pairs_wanted_matches_the_all_index_scan() {
+        // Small slab: alternating x/y strokes plus a via grid.
+        let mut filaments = Vec::new();
+        for i in 0..6 {
+            for j in 0..6 {
+                let x = i as f64 * 2.0e-3;
+                let y = j as f64 * 2.0e-3;
+                let (bx, by, bz) = if i % 2 == 0 {
+                    (x + 8.0e-3, y, 1.0e-3 * ((i + j) % 2) as f64)
+                } else {
+                    (x, y + 8.0e-3, 1.0e-3 * ((i + j) % 2) as f64)
+                };
+                filaments.push(
+                    Filament::new(&Segment::new(
+                        Node::new(x, y, bz),
+                        Node::new(bx, by, bz),
+                        0.2e-3,
+                        0.1e-3,
+                        COPPER,
+                    ))
+                    .expect("stroke"),
+                );
+                if (i + j) % 5 == 0 {
+                    filaments.push(
+                        Filament::new(&Segment::new(
+                            Node::new(x, y, 0.0),
+                            Node::new(x, y, 6.0e-3),
+                            0.2e-3,
+                            0.1e-3,
+                            COPPER,
+                        ))
+                        .expect("barrel"),
+                    );
+                }
+            }
+        }
+        let radius = 4.0e-3;
+        let full = near_pairs(&filaments, radius);
+        // The wanted subset: a vias-involved sample (odd branches
+        // include the barrels' neighbours in both directions).
+        let wanted: Vec<usize> = (0..filaments.len()).filter(|i| i % 3 == 0).collect();
+        let subset = near_pairs_wanted(&filaments, radius, &wanted);
+        for (&branch, list) in wanted.iter().zip(&subset) {
+            // Expected set from the full scan itself: branch's own
+            // upper-side members unioned with the branches that list
+            // it (their upper sides), self excluded.
+            let mut expected: Vec<u32> = full[branch]
+                .iter()
+                .copied()
+                .filter(|&other| other as usize != branch)
+                .collect();
+            for (other, list_other) in full.iter().enumerate() {
+                if other < branch && list_other.contains(&(branch as u32)) {
+                    expected.push(other as u32);
+                }
+            }
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(
+                list, &expected,
+                "wanted list for branch {branch} must equal the inverted full scan"
+            );
+        }
     }
 }

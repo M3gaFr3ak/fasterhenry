@@ -192,8 +192,9 @@ impl ViaCensus {
 
 /// A branch is a via when its current direction is predominantly
 /// z-directed; 2.5D decks route everything else in the XY plane, so
-/// only via barrels come near vertical.
-const VIA_IS_Z: f64 = 0.5;
+/// only via barrels come near vertical. Engine-visible (the spine's
+/// slot list rides the same threshold).
+pub(crate) const VIA_IS_Z: f64 = 0.5;
 
 /// Per-XY-cell via density at bin pitch `bin_m`, with the optional
 /// threshold split. Single-threaded by design: the via population is
@@ -361,6 +362,9 @@ pub struct ViaMembership {
     /// Patch member branch indices: vias at the branches' own order,
     /// then the qualifying pour members, patch by patch.
     pub members: Vec<Vec<usize>>,
+    /// Per branch the owning patch's id (`None` off every patch) -
+    /// the spine builder's same-patch exclusion rides this.
+    pub patch_of_branch: Vec<Option<u32>>,
     /// Total z-directed (via barrel) branches the scan saw. Aggregate
     /// sizing only - every via defines/occupies a cell by
     /// construction, so every counted branch also exits in exactly
@@ -444,6 +448,15 @@ pub fn via_patch_membership(
     }
     ViaMembership {
         members,
+        patch_of_branch: {
+            let mut map: Vec<Option<u32>> = vec![None; filaments.len()];
+            for (&branch, &key) in &cell_of_ceil {
+                if let Some(&patch) = patch_of.get(&key) {
+                    map[branch] = Some(patch);
+                }
+            }
+            map
+        },
         via_branches,
     }
 }

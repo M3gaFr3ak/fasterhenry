@@ -153,6 +153,8 @@ mod fft;
 mod grid;
 pub(crate) mod near;
 
+pub(crate) use near::near_pairs_wanted;
+
 use nalgebra::Vector3;
 use rayon::prelude::*;
 use thiserror::Error;
