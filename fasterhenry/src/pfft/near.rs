@@ -15,6 +15,8 @@
 
 use nalgebra::Vector3;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use wide::f64x4;
 
 use super::grid::{Grid, Projection};
@@ -59,13 +61,45 @@ pub(crate) fn near_pairs(filaments: &[Filament], radius: f64) -> Vec<Vec<u32>> {
 /// the module doc) is paid twice for an honest gate.
 pub(crate) fn near_pairs_count(filaments: &[Filament], radius: f64) -> Vec<u32> {
     let structure = NearBins::build(filaments, radius);
-    (0..structure.bars.len())
+    let bars = structure.bars.len();
+    let start = Instant::now();
+    let pairs_seen = AtomicU64::new(0);
+    let bars_seen = AtomicU64::new(0);
+    let last_printed = AtomicU64::new(0);
+    let counts: Vec<u32> = (0..bars)
         .into_par_iter()
         .map(|index| {
             let list = structure.candidates_for(index, true);
+            pairs_seen.fetch_add(list.len() as u64, Ordering::Relaxed);
+            let done = bars_seen.fetch_add(1, Ordering::Relaxed) + 1;
+            // Progress ticker: at most one line every 20 s of wall, one
+            // winner per slot via compare-exchange (the ekart lane sat
+            // silent in this walk long enough to be indistinguishable
+            // from a hang; the walk's cost is postures-dependent and the
+            // operator cannot guess it up front).
+            let secs = start.elapsed().as_secs();
+            let prev = last_printed.load(Ordering::Relaxed);
+            if secs.saturating_sub(prev) >= 20
+                && last_printed
+                    .compare_exchange(prev, secs, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let pairs = pairs_seen.load(Ordering::Relaxed);
+                let rate = pairs as f64 / 1e9 / start.elapsed().as_secs_f64().max(1e-9);
+                eprintln!(
+                    "pfft: counting: bar {index} of {bars} ({done} done), {pairs} candidates, {rate:.2} Gpairs/s",
+                );
+            }
             list.len() as u32
         })
-        .collect()
+        .collect();
+    eprintln!(
+        "pfft: counting: done, {} bars in {:.1} s, {} candidates",
+        bars,
+        start.elapsed().as_secs_f64(),
+        pairs_seen.load(Ordering::Relaxed),
+    );
+    counts
 }
 
 /// The same scan restricted to QUERIED branch indices: for each
