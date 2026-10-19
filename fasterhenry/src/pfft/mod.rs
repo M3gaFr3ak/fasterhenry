@@ -430,12 +430,11 @@ impl PfftOperator {
             grid.dims, padded, fft_gb, fft_gb / 3.0, pairs_gb, pairs_estimate, census_gb,
         );
         if let Ok(budget) = std::env::var("FASTERHENRY_MEMORY_BUDGET_GB") {
-            let budget: f64 = budget
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| PfftError::InvalidParameter(
+            let budget: f64 = budget.trim().parse::<f64>().map_err(|_| {
+                PfftError::InvalidParameter(
                     "FASTERHENRY_MEMORY_BUDGET_GB must be a finite number of GB",
-                ))?;
+                )
+            })?;
             if !(budget.is_finite() && budget > 0.0) {
                 return Err(PfftError::InvalidParameter(
                     "FASTERHENRY_MEMORY_BUDGET_GB must be a finite number of GB",
@@ -456,6 +455,7 @@ impl PfftOperator {
         eprintln!("pfft: projecting {} filaments to the grid ...", n);
         let projections = grid::project_all(&grid, filaments, radius);
         eprintln!("pfft: enumerating near-field pairs ...");
+        crate::memgate::set_stage(crate::memgate::STAGE_PFFT_OPERATOR);
         let pairs = near::near_pairs(filaments, radius);
         eprintln!(
             "pfft: near-field census: {} directed pairs, exact ({:.1} GB of {} config budget)",

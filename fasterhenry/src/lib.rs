@@ -71,6 +71,7 @@ pub mod geometry;
 pub mod gmres;
 pub mod inductance;
 pub mod iterative;
+pub mod memgate;
 pub mod mesh;
 pub mod pfft;
 pub mod plane;

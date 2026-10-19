@@ -297,6 +297,7 @@ impl IterativeSystem {
                 PrecondKind::None => Precond::Identity,
                 PrecondKind::Jacobi => Precond::Jacobi(self.r_diag.clone()),
             };
+            crate::memgate::set_stage(crate::memgate::STAGE_GMRES);
             let (z, outcomes) = schur_complement_gmres(
                 &self.r_ep,
                 &self.r_pp,
@@ -322,6 +323,7 @@ impl IterativeSystem {
                 PrecondKind::None => Precond::Identity,
                 PrecondKind::Jacobi => Precond::Jacobi(diagonal),
             };
+            crate::memgate::set_stage(crate::memgate::STAGE_GMRES);
             schur_complement_gmres(
                 &complex(&self.r_ep, &self.l_ep),
                 &complex(&self.r_pp, &self.l_pp),
@@ -535,6 +537,7 @@ impl<T: ComplexField<RealField = f64> + Copy + Send + Sync + FaerComplexField> P
     where
         T: crate::cubel::FieldParts,
     {
+        crate::memgate::set_stage(crate::memgate::STAGE_PRECOND);
         let radius_mult: f64 = std::env::var("FASTERHENRY_CUBEL_RADIUS_MULT")
             .ok()
             .and_then(|v| v.trim().parse().ok())

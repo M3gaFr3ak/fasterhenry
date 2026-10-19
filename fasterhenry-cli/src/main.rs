@@ -10,7 +10,61 @@ use fasterhenry_cli::inp::ParseOptions;
 use fasterhenry_cli::spice::write_spice_subckt;
 use fasterhenry_cli::{read_inputs_with, run_reporting_with, solver_for};
 
+/// Runtime memory governor: while `FASTERHENRY_MEMORY_BUDGET_GB` is set,
+/// a background thread reads /proc/self/status VmRSS once a second and
+/// refuses (exit 134, never an OOM-kill) when the measured RSS crosses
+/// the budget, naming the phase via [`fasterhenry::memgate`]. This is
+/// the mid-run half of the policy; the pre-allocation census in
+/// `PfftOperator::new` is the pre-flight half. Unset budget = no
+/// watchdog, exactly like before.
+fn arm_memory_governor() {
+    let Ok(budget) = std::env::var("FASTERHENRY_MEMORY_BUDGET_GB") else {
+        return;
+    };
+    let budget: f64 = match budget.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() && value > 0.0 => value,
+        _ => {
+            eprintln!(
+                "error: FASTERHENRY_MEMORY_BUDGET_GB must be a finite number of GB, got {budget:?}"
+            );
+            std::process::exit(2);
+        }
+    };
+    std::thread::spawn(move || {
+        let budget_bytes = budget * 1e9;
+        let refuse_at = 0.97 * budget_bytes;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let Some(rss_bytes) = read_own_vm_rss_bytes() else {
+                continue; // /proc missing or unparseable: never false-fire
+            };
+            if (rss_bytes as f64) >= refuse_at {
+                let stage = fasterhenry::memgate::stage_name();
+                eprintln!(
+                    "error: runtime memory governor: RSS {:.1} GB crossed the FASTERHENRY_MEMORY_BUDGET_GB={budget:.0} GB budget during {stage}; refusing to continue (exit 134). Raise the budget or shrink the operator/precond (FASTERHENRY_PFFT_CPF / _RADIUS / _ORDER, CUBEL_RADIUS_MULT).",
+                    rss_bytes as f64 / 1e9,
+                );
+                std::process::exit(134);
+            }
+        }
+    });
+}
+
+/// Resident memory of this process in bytes, from /proc/self/status.
+fn read_own_vm_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+        return Some(kb * 1024);
+    }
+    None
+}
+
 fn main() -> anyhow::Result<()> {
+    arm_memory_governor();
     let invocation = Invocation::parse();
     // The one difference between the two forms: a bare invocation always
     // writes a Zc.mat, `run` only when asked.
