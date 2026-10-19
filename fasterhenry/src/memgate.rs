@@ -46,6 +46,22 @@ pub fn stage_name() -> &'static str {
     STAGE_NAMES.get(stage).copied().unwrap_or("unknown phase")
 }
 
+/// Resident memory of this process in bytes, from /proc/self/status.
+/// Linux-only by intent (this crate targets Linux batch runs); `None`
+/// means the file is missing or unparseable, and callers must treat
+/// that as "cannot measure", never as zero.
+pub fn rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+        return Some(kb * 1024);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

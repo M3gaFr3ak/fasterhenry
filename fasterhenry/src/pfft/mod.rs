@@ -457,10 +457,12 @@ impl PfftOperator {
         eprintln!("pfft: enumerating near-field pairs ...");
         crate::memgate::set_stage(crate::memgate::STAGE_PFFT_OPERATOR);
         let pairs = near::near_pairs(filaments, radius);
+        let pair_total: usize = pairs.iter().map(|row| row.len()).sum();
         eprintln!(
-            "pfft: near-field census: {} directed pairs, exact ({:.1} GB of {} config budget)",
+            "pfft: near-field census: {} neighbor rows, {} directed pairs, exact ({:.1} GB at 24 B/pair; budget {})",
             pairs.len(),
-            24.0 * pairs.len() as f64 / 1e9,
+            pair_total,
+            24.0 * pair_total as f64 / 1e9,
             std::env::var("FASTERHENRY_MEMORY_BUDGET_GB").unwrap_or_else(|_| "none".to_string()),
         );
         eprintln!("pfft: precorrecting near-field (exact kernels) ...");

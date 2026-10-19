@@ -257,7 +257,10 @@ pub(crate) fn precorrect(
             let r = row(i, filaments, grid, projections, &partners[i], &table);
             let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if d % step == 0 || d == n {
-                eprintln!("pfft: precorrect {d}/{n}");
+                let rss = crate::memgate::rss_bytes()
+                    .map(|b| format!("{:.1} GB", b as f64 / 1e9))
+                    .unwrap_or_else(|| "unreadable".to_string());
+                eprintln!("pfft: precorrect {d}/{n} (rss {rss})");
             }
             r
         })

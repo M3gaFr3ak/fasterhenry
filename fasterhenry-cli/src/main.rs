@@ -35,7 +35,7 @@ fn arm_memory_governor() {
         let refuse_at = 0.97 * budget_bytes;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            let Some(rss_bytes) = read_own_vm_rss_bytes() else {
+            let Some(rss_bytes) = fasterhenry::memgate::rss_bytes() else {
                 continue; // /proc missing or unparseable: never false-fire
             };
             if (rss_bytes as f64) >= refuse_at {
@@ -48,19 +48,6 @@ fn arm_memory_governor() {
             }
         }
     });
-}
-
-/// Resident memory of this process in bytes, from /proc/self/status.
-fn read_own_vm_rss_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        let Some(rest) = line.strip_prefix("VmRSS:") else {
-            continue;
-        };
-        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-        return Some(kb * 1024);
-    }
-    None
 }
 
 fn main() -> anyhow::Result<()> {
