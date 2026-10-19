@@ -64,6 +64,7 @@
 #![warn(missing_docs)]
 
 pub mod census;
+pub mod conv;
 pub mod coupling;
 mod cubel;
 pub mod dense;
