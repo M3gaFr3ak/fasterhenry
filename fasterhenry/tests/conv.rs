@@ -216,3 +216,49 @@ fn spine_compositions_never_change_the_answer() {
     std::env::remove_var("FASTERHENRY_CONV_SPINE");
     std::env::remove_var("FASTERHENRY_PRECOND");
 }
+#[test]
+fn conv_matvec_matches_the_dense_path() {
+    let _env = env_lock();
+    // Increment 5: FASTERHENRY_CONV_MATVEC=1 swaps the equation to
+    // `grid far + conv near model` (the answer-exactness amendment).
+    // The reference is still the dense path; what this pins is the
+    // composition plumbing (counting every pair exactly once) and the
+    // accepted model error - precond here is the legacy two-level so
+    // the GMRES referee sees the composed operator only.
+    std::env::set_var("FASTERHENRY_CONV_MATVEC", "1");
+    std::env::set_var("FASTERHENRY_PRECOND", "two-level");
+    let (geometry, ports, discretization) = three_layer_structure();
+    let dense = MeshSystem::assemble(&geometry, &ports, &discretization).unwrap();
+    let iterative = IterativeSystem::assemble(
+        &geometry,
+        &ports,
+        &discretization,
+        &IterativeParams::default(),
+    )
+    .unwrap();
+    for frequency in [1.0e3, 5.0e6] {
+        let expected = dense.impedance(frequency).unwrap();
+        let solution = iterative.solve(frequency).unwrap();
+        let difference = (solution.impedance.clone() - &expected).norm() / expected.norm();
+        let iterations: Vec<usize> = solution.gmres.iter().map(|o| o.iterations).collect();
+        println!(
+            "conv-matvec at {frequency:e} Hz: difference {difference:e}, GMRES iterations {iterations:?}"
+        );
+        for (port_i, outcome) in solution.gmres.iter().enumerate() {
+            assert!(outcome.converged, "conv-matvec port {port_i}: {outcome:?}");
+        }
+        // Measured vs the dense path on the accepted deck: 3.3e-3 at
+        // 1 kHz, 1.65e-1 at 5 MHz (relative). This IS the answer
+        // budget the exactness amendment prices: the near model is
+        // median-geometry difference kernels + exact census patches,
+        // so deck-scale pour pairs land in this class - the ceiling
+        // only exists to make regressions loud, not to claim parity.
+        assert!(
+            difference <= 2.5e-1,
+            "conv-matvec vs dense relative difference {difference:e} at {frequency:e} Hz \
+             beyond the measured budget"
+        );
+    }
+    std::env::remove_var("FASTERHENRY_CONV_MATVEC");
+    std::env::remove_var("FASTERHENRY_PRECOND");
+}

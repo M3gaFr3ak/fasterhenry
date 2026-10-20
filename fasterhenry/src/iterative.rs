@@ -75,7 +75,7 @@ use nalgebra::{ComplexField, DMatrix, Dyn, LU};
 use num_complex::Complex;
 use rayon::prelude::*;
 
-use crate::conv::{mesh_gather, mesh_scatter, ConvPrecond, TabComposition};
+use crate::conv::{mesh_gather, mesh_scatter, ConvPrecond, MatvecCore, TabComposition};
 use crate::cubel::{CubelGlobal, CubelParams, CubelPattern, AVER_ROWS};
 use crate::filament::Filament;
 use crate::geometry::Geometry;
@@ -129,6 +129,10 @@ pub struct IterativeSystem {
     resistances: Vec<f64>,
     mesh: MeshMatrix,
     operator: PfftOperator,
+    /// The conv-matvec near half ([`MatvecCore`], increment 5): built
+    /// when `FASTERHENRY_CONV_MATVEC=1`, alongside a far-only pFFT
+    /// operator. `None` = the historical precorrect operator.
+    matvec: Option<MatvecCore>,
     gmres: GmresParams,
     /// `M R Mᵀ` and `M L Mᵀ` restricted to (internal × port) and
     /// (port × port) loops.
@@ -167,7 +171,96 @@ impl IterativeSystem {
         let resistances: Vec<f64> = filaments.iter().map(filament_resistance).collect();
 
         let operator_start = Instant::now();
-        let operator = PfftOperator::new(&filaments, &params.pfft)?;
+        // The conv-matvec lane (increment 5): `FASTERHENRY_CONV_MATVEC=1`
+        // swaps the equation to `grid far + conv near model` - the
+        // answer-exactness contract amendment (user-authorized; see the
+        // increment-5 decision in the peec books). Default OFF keeps the
+        // historical precorrect operator byte-for-byte.
+        let conv_matvec = std::env::var("FASTERHENRY_CONV_MATVEC")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        let mut pfft_params = params.pfft.clone();
+        if conv_matvec {
+            pfft_params.precorrect_near = false;
+        }
+        let operator = PfftOperator::new(&filaments, &pfft_params)?;
+        let matvec = if conv_matvec {
+            // The n matrix of the near model's stages is omega-free; the
+            // tab/spine compositions reuse the engine's env knobs, so
+            // the A/B lane can price them independently.
+            let tab_composition = match std::env::var("FASTERHENRY_CONV_TABS")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("") | Some("both") => TabComposition::Both,
+                Some("matvec") => TabComposition::Matvec,
+                Some("off") => TabComposition::Off,
+                Some(other) => {
+                    eprintln!(
+                        "conv: warning: FASTERHENRY_CONV_TABS={other:?} not |both|matvec|off; using both"
+                    );
+                    TabComposition::Both
+                }
+            };
+            let tab_pour = match std::env::var("FASTERHENRY_CONV_TAB_POUR")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("") | Some("1") | Some("on") | Some("true") => true,
+                Some("0") | Some("off") | Some("false") => false,
+                Some(other) => {
+                    eprintln!(
+                        "conv: warning: FASTERHENRY_CONV_TAB_POUR={other:?} not 0/1; using 1"
+                    );
+                    true
+                }
+            };
+            let spine_composition = match std::env::var("FASTERHENRY_CONV_SPINE")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("") | Some("both") => TabComposition::Both,
+                Some("matvec") => TabComposition::Matvec,
+                Some("off") => TabComposition::Off,
+                Some(other) => {
+                    eprintln!(
+                        "conv: warning: FASTERHENRY_CONV_SPINE={other:?} not |both|matvec|off; using both"
+                    );
+                    TabComposition::Both
+                }
+            };
+            let parse_env_m = |name: &str| -> Option<f64> {
+                let text = std::env::var(name).ok()?;
+                match text.trim().parse::<f64>() {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        eprintln!(
+                            "conv: warning: {name}={text:?} not a number; falling through the bin chain"
+                        );
+                        None
+                    }
+                }
+            };
+            let tab_bin_m = parse_env_m("FASTERHENRY_CENSUS_VIA_BIN_M")
+                .or_else(|| parse_env_m("FASTERHENRY_CENSUS_RADIUS_M"))
+                .unwrap_or_else(|| crate::census::derived_radius(&filaments));
+            Some(
+                MatvecCore::build(
+                    &operator,
+                    &filaments,
+                    tab_composition,
+                    tab_bin_m,
+                    tab_pour,
+                    spine_composition,
+                )
+                .map_err(SolveError::from)?,
+            )
+        } else {
+            None
+        };
         let operator_seconds = operator_start.elapsed().as_secs_f64();
 
         let (internal, port_count) = (mesh.internal_count(), mesh.port_count());
@@ -226,6 +319,7 @@ impl IterativeSystem {
             resistances,
             mesh,
             operator,
+            matvec,
             gmres: params.gmres,
             r_ep,
             l_ep,
@@ -436,13 +530,46 @@ impl IterativeSystem {
         gather(&self.mesh, x.len(), &drop)
     }
 
-    /// `M_e (R + jωL) M_eᵀ · x`, with `L` the pFFT operator.
+    /// `M_e (R + j omega L) M_e^T x`, with `L` the pFFT operator, plus
+    /// the conv-matvec near half when present (the two flux halves are
+    /// additive by the substitution construction; the core's corr
+    /// values cancel the stages' overlap on member pairs).
     fn apply_ac(&self, omega: f64, x: &[C64]) -> Vec<C64> {
         let current = self.scatter(x);
         let re: Vec<f64> = current.iter().map(|c| c.re).collect();
         let im: Vec<f64> = current.iter().map(|c| c.im).collect();
+        let near_re = if let Some(matvec) = &self.matvec {
+            Some((
+                {
+                    let mut flux = vec![0.0f64; re.len()];
+                    matvec.apply(&re, &mut flux);
+                    flux
+                },
+                {
+                    let mut flux = vec![0.0f64; im.len()];
+                    matvec.apply(&im, &mut flux);
+                    flux
+                },
+            ))
+        } else {
+            None
+        };
         let (flux_re, flux_im) =
             rayon::join(|| self.operator.apply(&re), || self.operator.apply(&im));
+        let (flux_re, flux_im) = match &near_re {
+            Some((near_re, near_im)) => {
+                let mut re = flux_re;
+                let mut im = flux_im;
+                for (dst, src) in re.iter_mut().zip(near_re) {
+                    *dst += *src;
+                }
+                for (dst, src) in im.iter_mut().zip(near_im) {
+                    *dst += *src;
+                }
+                (re, im)
+            }
+            None => (flux_re, flux_im),
+        };
         let drop: Vec<C64> = (0..current.len())
             .map(|b| {
                 let r = self.resistances[b];

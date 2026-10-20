@@ -496,6 +496,7 @@ fn parameter_study() {
                         },
                         near_field_radius: radius,
                         interpolation_order: order,
+                        precorrect_near: true,
                     };
                     let start = Instant::now();
                     let op = PfftOperator::new(&filaments, &params).unwrap();

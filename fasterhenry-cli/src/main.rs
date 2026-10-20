@@ -145,6 +145,14 @@ fn main() -> anyhow::Result<()> {
     {
         eprintln!("solver: iterative (matrix-free precorrected-FFT + GMRES)");
     }
+    if std::env::var("FASTERHENRY_CONV_MATVEC")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "operator: conv-matvec composition (far pFFT + difference-kernel conv + exact tab/spine patches); answer budget = discretization + far knobs + pitch"
+        );
+    }
     eprintln!(
         "load: solve dispatch reached, wall {:.1} s at this point",
         wall.elapsed().as_secs_f64()

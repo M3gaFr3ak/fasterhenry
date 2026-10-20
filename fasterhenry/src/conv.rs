@@ -919,7 +919,7 @@ fn sample_family_kernel(
 mod layer_pair_tests {
     use super::*;
 
-    const PITCH: f64 = 1e-3;
+    pub(crate) const PITCH: f64 = 1e-3;
     const LENGTH: f64 = 4e-3;
     const W: f64 = 0.2e-3;
     const H: f64 = 0.1e-3;
@@ -937,7 +937,7 @@ mod layer_pair_tests {
     /// centre lands on a raster cell, so the pitch-matched raster
     /// holds one filament per cell per axis and the conv operator
     /// value must equal the exact mutual to float noise.
-    fn deck() -> Vec<Filament> {
+    pub(crate) fn deck() -> Vec<Filament> {
         let mut filaments = Vec::new();
         for i in 0..5 {
             let y = i as f64 * PITCH;
@@ -979,6 +979,7 @@ mod layer_pair_tests {
             TabComposition::Both,
             PITCH,
             true,
+            None,
         )
         .expect("uniform deck builds tab blocks");
         assert_eq!(blocks.len(), 1, "one patch: the deck's via cell");
@@ -1059,6 +1060,7 @@ mod layer_pair_tests {
             TabComposition::Both,
             PITCH,
             true,
+            None,
         )
         .expect("deck builds a spine");
         let spine = spine.expect("a deck with a via carries a spine");
@@ -1133,6 +1135,7 @@ mod layer_pair_tests {
             TabComposition::Both,
             PITCH,
             true,
+            None,
         )
         .expect("two-patch deck builds a spine");
         let spine = spine.expect("a deck with vias carries a spine");
@@ -1294,6 +1297,149 @@ mod layer_pair_tests {
 //   spine (the inc3 audit's F1 pattern repeating)]**
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The conv-matvec operator core (v2 slice 2b increment 5). The ENGINE's
+// equation is no longer the pair-list precorrect: the near band is owned
+// by a displacement-domain DIFFERENCE model - see the increment-5
+// decision in the peec books (answer exactness = discretization + pFFT
+// far knobs + the conv near model). Header honesty: this composition is
+// `conv-matvec`, not `precorrect-FFT - near-correct`.
+// ---------------------------------------------------------------------------
+
+/// A displacement-domain DIFFERENCE kernel: `Kdiff(u) =
+/// L_exact(synthetic median pair at u) - L_grid(same pair)` over the
+/// near band, zero elsewhere, FFT-prepared once for forward circular
+/// convolution. The displacement convention matches [`ConvKernel`]'s
+/// raw wrapped layout (plane index 0 = displacement 0, negatives
+/// wrapping to the top rows/columns), so the same raster geometry
+/// hosts source cells and victim reads.
+pub struct DiffKernel {
+    /// Raster side.
+    n: usize,
+    /// Raster cell pitch (metres).
+    cell_m: f64,
+    /// The difference table's half-width, in cells. Zero outside.
+    band_cells: usize,
+    /// `FFT2(Kdiff)` in the raw wrapped layout; the apply's multiply.
+    kernel_hat: Vec<Complex64>,
+    /// The REAL signed-displacement table `[2r+1]^2` (the substitution
+    /// stages read it back per pair). Empty when `r == 0`.
+    time_window: Vec<f64>,
+    fft: Arc<dyn Fft<f64>>,
+    ifft: Arc<dyn Fft<f64>>,
+}
+
+impl DiffKernel {
+    /// Builds the difference kernel. `sample(dx, dy)` receives SIGNED
+    /// displacement cells (`|dx|, |dy| <= band_cells`); it is called
+    /// exactly that many times, never outside the band.
+    pub fn build_diff(
+        n: usize,
+        cell_m: f64,
+        band_cells: usize,
+        sample: impl Fn(i64, i64) -> f64,
+    ) -> Self {
+        assert!(n >= 3, "diff kernel raster too small: {n}");
+        assert!(
+            cell_m.is_finite() && cell_m > 0.0,
+            "diff kernel pitch must be a positive metre value: {cell_m}"
+        );
+        let reach = band_cells as i64;
+        let dims = 2 * band_cells + 1;
+        let mut time_window = vec![0.0; dims * dims];
+        for (index, value) in time_window.iter_mut().enumerate() {
+            let dx = index as i64 / dims as i64 - reach;
+            let dy = index as i64 % dims as i64 - reach;
+            *value = sample(dx, dy);
+        }
+        // The plane: window entries at their wrapped positions, zero
+        // elsewhere (never sampled beyond the band).
+        let wrap = |index: i64| -> i64 {
+            let half = n as i64 / 2;
+            if index > half {
+                index - n as i64
+            } else {
+                index
+            }
+        };
+        let mut plane = vec![Complex64::new(0.0, 0.0); n * n];
+        for row in 0..n as i64 {
+            for col in 0..n as i64 {
+                let (dx, dy) = (wrap(row), wrap(col));
+                if dx.abs() <= reach && dy.abs() <= reach {
+                    plane[(row * n as i64 + col) as usize] = Complex64::new(
+                        time_window[((dx + reach) * dims as i64 + dy + reach) as usize],
+                        0.0,
+                    );
+                }
+            }
+        }
+        let fft: Arc<dyn Fft<f64>> = FftPlanner::new().plan_fft_forward(n);
+        let mut kernel_hat = plane;
+        apply_fft2(&*fft, &mut kernel_hat);
+        let ifft: Arc<dyn Fft<f64>> = FftPlanner::new().plan_fft_inverse(n);
+        Self {
+            n,
+            cell_m,
+            band_cells,
+            kernel_hat,
+            time_window,
+            fft,
+            ifft,
+        }
+    }
+
+    /// The forward circular-convolution apply, in place (same layout
+    /// and normalization contract as [`ConvKernel::apply_forward`]).
+    ///
+    /// # Panics
+    ///
+    /// If `field.len()` differs from the raster side squared.
+    pub fn apply_forward(&self, field: &mut [Complex64]) {
+        assert_eq!(
+            field.len(),
+            self.n * self.n,
+            "field size must equal the diff kernel raster"
+        );
+        let n = self.n;
+        apply_fft2(&*self.fft, field);
+        for (value, gain) in field.iter_mut().zip(&self.kernel_hat) {
+            *value = *value * *gain;
+        }
+        apply_fft2(&*self.ifft, field);
+        let norm = 1.0 / (n * n) as f64;
+        for value in field.iter_mut() {
+            *value = *value * norm;
+        }
+    }
+
+    /// The kernel's cell pitch (metres), test-visible.
+    pub fn cell_m(&self) -> f64 {
+        self.cell_m
+    }
+
+    /// Raster side.
+    pub fn raster(&self) -> usize {
+        self.n
+    }
+
+    /// The kernel's cell pitch (metres), test-visible.
+    pub fn diff_band(&self) -> usize {
+        self.band_cells
+    }
+
+    /// The substitution stages' lookup: the model's difference value at
+    /// signed displacement cells, zero outside the band.
+    pub fn time_at(&self, dx: i64, dy: i64) -> f64 {
+        let reach = self.band_cells as i64;
+        if dx.abs() > reach || dy.abs() > reach {
+            return 0.0;
+        }
+        let dims = 2 * self.band_cells + 1;
+        self.time_window[((dx + reach) * dims as i64 + dy + reach) as usize]
+    }
+}
+
 /// One (layer pair, axis family) population pair of the smoother.
 pub struct ConvPrecond {
     operator: LayerPairOperator,
@@ -1385,6 +1531,7 @@ impl ConvPrecond {
             composition,
             tab_bin_m,
             tab_pour,
+            None,
         )?;
         let spine = Self::build_spine(
             filaments,
@@ -1393,6 +1540,7 @@ impl ConvPrecond {
             spine_composition,
             tab_bin_m,
             tab_pour,
+            None,
         )?;
         Ok(Self {
             operator,
@@ -1405,6 +1553,12 @@ impl ConvPrecond {
     /// The explicit per-patch blocks: member branches from the
     /// census's flood fill, exact dense mutuals among them, LU
     /// factored when the smoother composition is live.
+    ///
+    /// `corr_fn` (the conv-matvec substitution, increment 5): when
+    /// present, each block additionally carries per-pair substitution
+    /// values `corr = L_exact - L_grid(pair) - Kdiff(u)` over the REAL
+    /// member branch indices, swapped into the flux by `flux()`; the
+    /// smoother-side builds pass `None`.
     fn build_tabs(
         filaments: &[Filament],
         resistances: &[f64],
@@ -1412,6 +1566,7 @@ impl ConvPrecond {
         composition: TabComposition,
         tab_bin_m: f64,
         tab_pour: bool,
+        corr_fn: Option<&dyn Fn(usize, usize) -> f64>,
     ) -> Result<Vec<TabBlock>, KernelError> {
         if composition == TabComposition::Off {
             return Ok(Vec::new());
@@ -1437,7 +1592,20 @@ impl ConvPrecond {
                 }
                 l[row * (count + 1)] = l_row;
             }
-            blocks.push(TabBlock::build(members, l, resistances, omega, smoother));
+            let corr = corr_fn.map(|f| {
+                let indices = &members;
+                (0..count)
+                    .flat_map(|row| (0..count).map(move |col| f(indices[row], indices[col])))
+                    .collect::<Vec<f64>>()
+            });
+            blocks.push(TabBlock::build(
+                members,
+                l,
+                resistances,
+                omega,
+                smoother,
+                corr,
+            ));
         }
         Ok(blocks)
     }
@@ -1455,6 +1623,7 @@ impl ConvPrecond {
         composition: TabComposition,
         tab_bin_m: f64,
         tab_pour: bool,
+        corr_fn: Option<&dyn Fn(usize, usize) -> f64>,
     ) -> Result<Option<SpineCsr>, KernelError> {
         if composition == TabComposition::Off {
             return Ok(None);
@@ -1493,6 +1662,7 @@ impl ConvPrecond {
         // directions per pair (mutuals are symmetric), so only the via
         // side is stored.
         let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
+        let mut row_corr: Vec<Vec<f64>> = Vec::with_capacity(vias.len());
         for (&via, list) in vias.iter().zip(&all) {
             let mut row: Vec<(u32, f64)> = Vec::new();
             for &partner in list {
@@ -1515,16 +1685,25 @@ impl ConvPrecond {
                 row.push((partner as u32, mutual));
             }
             row.sort_by_key(|&(p, _)| p);
+            row_corr.push(
+                row.iter()
+                    .map(|&(p, _)| corr_fn.map_or(0.0, |f| f(via, p as usize)))
+                    .collect::<Vec<f64>>(),
+            );
             slot_rows.push(row);
         }
         let mut row_ptr: Vec<u32> = Vec::with_capacity(vias.len() + 1);
         row_ptr.push(0u32);
         let mut col: Vec<u32> = Vec::new();
         let mut values: Vec<f64> = Vec::new();
-        for row in slot_rows.iter() {
-            for &(partner, mutual) in row.iter() {
+        let mut corr: Option<Vec<f64>> = corr_fn.map(|_| Vec::new());
+        for (row, corr_row) in slot_rows.iter().zip(&row_corr) {
+            for (&(partner, mutual), sub) in row.iter().zip(corr_row) {
                 col.push(partner);
                 values.push(mutual);
+                if let Some(corr_values) = corr.as_mut() {
+                    corr_values.push(*sub);
+                }
             }
             row_ptr.push(col.len() as u32);
         }
@@ -1549,6 +1728,7 @@ impl ConvPrecond {
             values,
             jacobi,
             vias,
+            corr,
         }))
     }
 
@@ -1697,6 +1877,12 @@ pub struct TabBlock {
     /// pivot permutation, when the smoother composition is live
     /// (`None` under `Matvec`).
     lu: Option<(Vec<C64>, Vec<usize>)>,
+    /// The conv-matvec substitution values (increment 5): per member
+    /// pair the amount to swap for the exact mutual so the composition
+    /// (grid far approximation + difference kernels + this) counts
+    /// every pair exactly once: `corr = L_exact - L_grid - Kdiff(u)`.
+    /// `None` for the smoother-side blocks.
+    corr: Option<Vec<f64>>,
 }
 
 impl TabBlock {
@@ -1708,6 +1894,7 @@ impl TabBlock {
         resistances: &[f64],
         omega: f64,
         smoother: bool,
+        corr: Option<Vec<f64>>,
     ) -> Self {
         let count = members.len();
         assert_eq!(
@@ -1774,7 +1961,12 @@ impl TabBlock {
         } else {
             None
         };
-        Self { members, l, lu }
+        Self {
+            members,
+            l,
+            lu,
+            corr,
+        }
     }
 
     /// The block's flux contribution: `flux[i] += L[i][j] *
@@ -1782,8 +1974,13 @@ impl TabBlock {
     /// imaginary flux accumulators both take it).
     fn flux(&self, currents: &[C64], flux_re: &mut [f64], flux_im: &mut [f64]) {
         let count = self.members.len();
+        // The substitution values replace the exact mutuals in the
+        // matvec composition (the exact amount is carried by the
+        // surrounding stages - see the increment-5 decision); the
+        // smoother side keeps the exact L.
+        let values: &Vec<f64> = self.corr.as_ref().unwrap_or(&self.l);
         for (i, &dst) in self.members.iter().enumerate() {
-            let row = &self.l[i * count..(i + 1) * count];
+            let row = &values[i * count..(i + 1) * count];
             let mut sum_re = 0.0f64;
             let mut sum_im = 0.0f64;
             for (j, &src) in self.members.iter().enumerate() {
@@ -1846,6 +2043,11 @@ pub struct SpineCsr {
     jacobi: Vec<C64>,
     /// The slot's branch index (ascending deck order).
     vias: Vec<usize>,
+    /// The conv-matvec substitution values (increment 5), aligned to
+    /// `values`: per stored pair the swap amount
+    /// `corr = L_exact - L_grid - Kdiff(u)`. `None` for the smoother
+    /// side.
+    corr: Option<Vec<f64>>,
 }
 
 impl SpineCsr {
@@ -1856,13 +2058,17 @@ impl SpineCsr {
         if self.vias.is_empty() {
             return;
         }
+        // Substitution values (matvec composition) replace the exact
+        // mutuals - the exact amount is carried by the surrounding
+        // stages.
+        let values = self.corr.as_deref().unwrap_or(&self.values);
         for (slot, &via) in self.vias.iter().enumerate() {
             let lo = self.row_ptr[slot] as usize;
             let hi = self.row_ptr[slot + 1] as usize;
             let mut sum_re = 0.0f64;
             let mut sum_im = 0.0f64;
             for (index, &partner) in self.col[lo..hi].iter().enumerate() {
-                let mutual = self.values[lo + index];
+                let mutual = values[lo + index];
                 sum_re += mutual * currents[partner as usize].re;
                 sum_im += mutual * currents[partner as usize].im;
                 // The transpose side (the via's current drops on the
@@ -1947,4 +2153,583 @@ fn sample_inverse_kernel(
         },
         damp,
     ))
+}
+// ---------------------------------------------------------------------------
+// The conv-matvec operator core (increment 5): the engine's equation
+// becomes `grid far + conv near model` - see the increment-5 decision in
+// the peec books. `MatvecCore` builds ONCE (all stages are real-L, omega
+// folds in the caller's AC hop) and its `apply` is a matrix product,
+// never an inverse.
+// ---------------------------------------------------------------------------
+
+/// Builds one family's difference kernel over the real far operator:
+/// synthetic median source + displaceable victim, sample =
+/// `mutual_inductance - far.pair_grid_estimate` (the per-pair closed
+/// form of the grid's own estimate), over the near band only.
+#[allow(clippy::too_many_arguments)]
+fn sample_difference_kernel(
+    far: &crate::pfft::PfftOperator,
+    filaments: &[Filament],
+    source_population: &[(usize, f64)],
+    victim_population: &[(usize, f64)],
+    src_axis: usize,
+    dst_axis: usize,
+    n: usize,
+    cell_m: f64,
+    band_cells: usize,
+    self_family: bool,
+) -> Result<DiffKernel, KernelError> {
+    let src_segment = representative_segment(filaments, source_population, src_axis);
+    let dst_segment = representative_segment(filaments, victim_population, dst_axis);
+    // The synthetic pair must sit inside the grid's valid box: the
+    // negative displacements would otherwise push the victim's
+    // projection stencil past the grid edge, silently truncating the
+    // double sum (measured on the accepted deck: the -u side returned
+    // garbage ~1e-7 while +u decayed cleanly). Translate the pair so
+    // its midpoint sits at the box centre; exact mutuals are
+    // translation-invariant, so only the grid term's absolute phase
+    // moves - the booked median-phase approximation of the difference
+    // table.
+    let translation = far
+        .grid_box()
+        .map(|(lo, hi)| (lo + hi) * 0.5 - (src_segment.center() + dst_segment.center()) * 0.5)
+        .unwrap_or_else(Vector3::zeros);
+    let translate = |segment: &Segment| -> Segment {
+        let a = segment.a.position() + translation;
+        let b = segment.b.position() + translation;
+        Segment::new(
+            Node::from([a.x, a.y, a.z]),
+            Node::from([b.x, b.y, b.z]),
+            segment.width,
+            segment.height,
+            segment.sigma,
+        )
+        .with_width_dir(
+            segment
+                .width_dir
+                .expect("representative carries an explicit width direction"),
+        )
+    };
+    let src =
+        Filament::new(&translate(&src_segment)).expect("representative segment is well-formed");
+    let (dst_a, dst_b) = (dst_segment.a.position(), dst_segment.b.position());
+    let (width, height, sigma, width_dir) = (
+        dst_segment.width,
+        dst_segment.height,
+        dst_segment.sigma,
+        dst_segment.width_dir,
+    );
+    Ok(DiffKernel::build_diff(n, cell_m, band_cells, |dx, dy| {
+        // The victim is displaced by the RELATIVE delta from its own
+        // median position, then the pair rides the box-centre
+        // translation: the table's (dx, dy) is the pair's true
+        // displacement, so (0, 0) is the unshifted median pair and the
+        // plane's displacement domain is centered.
+        let offset = Vector3::new(dx as f64 * cell_m, dy as f64 * cell_m, 0.0) + translation;
+        let displaced = Segment::new(
+            Node::from([dst_a.x + offset.x, dst_a.y + offset.y, dst_a.z + offset.z]),
+            Node::from([dst_b.x + offset.x, dst_b.y + offset.y, dst_b.z + offset.z]),
+            width,
+            height,
+            sigma,
+        )
+        .with_width_dir(width_dir.expect("representative carries an explicit width direction"));
+        let victim = Filament::new(&displaced).expect("displaced segment is well-formed");
+        let exact = if self_family && dx == 0 && dy == 0 {
+            // A true self family's zero displacement is the filament
+            // with itself. Cross families (cross axis, cross layer)
+            // have a coincident-but-distinct median pair here: the
+            // exact mutual is finite (perpendicular pairs: exactly
+            // zero) and the self shortcut would leak the self-L into
+            // that family's table (measured: the accepted deck's via
+            // cell leaked 3e-9 down its y->x family).
+            inductance::self_inductance(&src)
+        } else {
+            inductance::mutual_inductance(&src, &victim)
+                .expect("kernel-sample pair has aligned cross-sections by construction")
+        };
+        exact - far.pair_grid_estimate(&src, &victim)
+    }))
+}
+
+/// The conv-matvec operator's near half: the same layer-pair population
+/// structure as the smoother, but the family kernels are the FORWARD
+/// difference kernels ([`DiffKernel`]) and the tab/spine stages carry
+/// per-pair SUBSTITUTION values so the composition
+/// `grid + kernels + tabs + spine` counts every member pair exactly
+/// once. Unlike [`ConvPrecond`] this is the equation (part of it), so
+/// every stage is a forward product; nothing here inverts anything.
+pub struct MatvecCore {
+    operator: LayerPairOperator,
+    /// `kernels[li][lj][src_axis][dst_axis]`: the family's difference
+    /// kernel; `None` where either population is empty.
+    kernels: Vec<Vec<[[Option<DiffKernel>; 2]; 2]>>,
+    /// The census-patch blocks in substitution form (`Off` composition
+    /// produces none).
+    tabs: Vec<TabBlock>,
+    /// The branch-CSR cross spine in substitution form; `None` under
+    /// the `Off` composition.
+    spine: Option<SpineCsr>,
+}
+
+impl MatvecCore {
+    /// Builds the near half alongside the FAR-only pFFT operator
+    /// `far` (which owns the grid estimate every stage subtracts).
+    ///
+    /// Emits an honest header line about the composition (the
+    /// increment-5 decision's labeling clause).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        far: &crate::pfft::PfftOperator,
+        filaments: &[Filament],
+        tab_composition: TabComposition,
+        tab_bin_m: f64,
+        tab_pour: bool,
+        spine_composition: TabComposition,
+    ) -> Result<Self, KernelError> {
+        let operator = LayerPairOperator::build(filaments)?;
+        let layer_count = operator.layer_count();
+        // Near-band half width, in cells: the diff table's support.
+        // Three caps stack: the pFFT's own near radius (the posture's
+        // k * h) sets the physics; the raster never sees wrap-around
+        // support; and the victim's full projection stencil must stay
+        // inside the grid's valid box (the synthetic pair roams
+        // +-band*pitch around the box centre), else the -u side samps
+        // truncated stencils - silent garbage (measured on the
+        // accepted deck). Past the band the difference model drops to
+        // the grid alone: the per-pair error is the pFFT far error
+        // class - the booked answer budget, not a correction failure.
+        let radius_band = if far.near_radius() > 0.0 {
+            (far.near_radius() / operator.pitch()).ceil() as usize + 1
+        } else {
+            1
+        };
+        let box_band = far.grid_box().map_or(radius_band, |(lo, hi)| {
+            let centre = (lo + hi) * 0.5;
+            let pitch = operator.pitch();
+            let room_x = (centre.x - lo.x).min(hi.x - centre.x);
+            let room_y = (centre.y - lo.y).min(hi.y - centre.y);
+            ((room_x / pitch).floor() as usize).min((room_y / pitch).floor() as usize)
+        });
+        let band_cells = radius_band
+            .min(box_band)
+            .min(operator.raster() / 2 - 1)
+            .max(1);
+        let mut kernels: Vec<Vec<[[Option<DiffKernel>; 2]; 2]>> = Vec::with_capacity(layer_count);
+        for li in 0..layer_count {
+            let mut row: Vec<[[Option<DiffKernel>; 2]; 2]> = Vec::with_capacity(layer_count);
+            for lj in 0..layer_count {
+                let mut families: [[Option<DiffKernel>; 2]; 2] = Default::default();
+                for src_axis in 0..2 {
+                    let src_population = operator.population(li, src_axis);
+                    if src_population.is_empty() {
+                        continue;
+                    }
+                    for dst_axis in 0..2 {
+                        let dst_population = operator.population(lj, dst_axis);
+                        if dst_population.is_empty() {
+                            continue;
+                        }
+                        let kernel = sample_difference_kernel(
+                            far,
+                            filaments,
+                            src_population,
+                            dst_population,
+                            src_axis,
+                            dst_axis,
+                            operator.raster(),
+                            operator.pitch(),
+                            band_cells,
+                            li == lj && src_axis == dst_axis,
+                        )?;
+                        families[src_axis][dst_axis] = Some(kernel);
+                    }
+                }
+                row.push(families);
+            }
+            kernels.push(row);
+        }
+        // The substitution closure: per pair (i, j) the amount the
+        // composition must swap in over the stage fluxes. The pair's
+        // family lookup keys on the RECEIVER displacement
+        // (centre_i - centre_j) in the (lj, li, aj, ai) family's
+        // difference table; manhattan-only (vias have no family, so
+        // their lookup is zero and the substitution is purely the
+        // exact-vs-grid difference).
+        let layer_of = branch_layers(filaments);
+        let pitch = operator.pitch();
+        // Scoped so the kernels borrow ends before the core moves them.
+        let (tabs, spine) = {
+            let kernels_ref = &kernels;
+            let corr_fn = move |i: usize, j: usize| -> f64 {
+                let (fi, fj) = (&filaments[i], &filaments[j]);
+                // The substitution: the stage's flux REPLACES its exact
+                // `l` with this value, so corr must be the full swap
+                // `L_exact - L_grid(pair) - Kdiff(u)`: composed with the
+                // far grid and the difference kernel the pair nets out
+                // to the exact mutual exactly once.
+                let mut sub = if i == j {
+                    inductance::self_inductance(fi)
+                } else {
+                    inductance::mutual_inductance(fi, fj)
+                        .expect("census patch pair has aligned geometry")
+                };
+                sub -= far.pair_grid_estimate(fi, fj);
+                if let (Some((ai, si)), Some((aj, sj))) =
+                    (flow_axis(fi.direction()), flow_axis(fj.direction()))
+                {
+                    let li = layer_of[i] as usize;
+                    let lj = layer_of[j] as usize;
+                    let displacement = fi.center() - fj.center();
+                    if let Some(kernel) = &kernels_ref[lj][li][aj][ai] {
+                        let dx = (displacement.x / pitch).round() as i64;
+                        let dy = (displacement.y / pitch).round() as i64;
+                        // The conv's per-pair coefficient rides the
+                        // sign product (the antiparallel twin's entry
+                        // is -h(u)), so the substitution amount does
+                        // too.
+                        sub -= kernel.time_at(dx, dy) * (si * sj);
+                    }
+                }
+                sub
+            };
+            let tabs = Self::build_tabs(
+                filaments,
+                &[],
+                tab_composition,
+                tab_bin_m,
+                tab_pour,
+                &corr_fn,
+            )?;
+            let spine = Self::build_spine(
+                filaments,
+                &[],
+                spine_composition,
+                tab_bin_m,
+                tab_pour,
+                &corr_fn,
+            )?;
+            (tabs, spine)
+        };
+        eprintln!(
+            "matvec: conv-matvec operator: {} layer pair families, band {} cells at pitch {:.3e} m, {} tab blocks, spine {}",
+            operator.layers.len(),
+            band_cells,
+            operator.pitch(),
+            tabs.len(),
+            spine.as_ref().map_or(0, |s| s.vias.len()),
+        );
+        Ok(Self {
+            operator,
+            kernels,
+            tabs,
+            spine,
+        })
+    }
+
+    /// Builds the substitution-form tab blocks: same census as the
+    /// smoother side, but each pair's table value is the SUBSTITUTION:
+    /// `corr = L_exact - L_grid(pair) - Kdiff(u)` keyed on the REAL
+    /// member branch indices via `corr_fn`.
+    fn build_tabs(
+        filaments: &[Filament],
+        _resistances: &[f64],
+        composition: TabComposition,
+        tab_bin_m: f64,
+        tab_pour: bool,
+        corr_fn: &dyn Fn(usize, usize) -> f64,
+    ) -> Result<Vec<TabBlock>, KernelError> {
+        if composition == TabComposition::Off {
+            return Ok(Vec::new());
+        }
+        let membership = crate::census::via_patch_membership(filaments, tab_bin_m, tab_pour);
+        let mut blocks = Vec::new();
+        for members in membership.members {
+            let count = members.len();
+            if count == 0 {
+                continue;
+            }
+            let mut l = vec![0.0f64; count * count];
+            for row in 0..count {
+                let l_row = inductance::self_inductance(&filaments[members[row]]);
+                for col in row + 1..count {
+                    let mutual = inductance::mutual_inductance(
+                        &filaments[members[row]],
+                        &filaments[members[col]],
+                    )?;
+                    l[row * count + col] = mutual;
+                    l[col * count + row] = mutual;
+                }
+                l[row * (count + 1)] = l_row;
+            }
+            // Smooth-self composition: no LU on the operator side.
+            let corr = {
+                let indices = &members;
+                (0..count)
+                    .flat_map(|row| (0..count).map(move |col| corr_fn(indices[row], indices[col])))
+                    .collect::<Vec<f64>>()
+            };
+            blocks.push(TabBlock::build(members, l, &[], 0.0, false, Some(corr)));
+        }
+        Ok(blocks)
+    }
+
+    /// Builds the substitution-form spine (mirrors the smoother's
+    /// construction; the `Both` Jacobi stage is smoother-only, empty
+    /// here).
+    fn build_spine(
+        filaments: &[Filament],
+        _resistances: &[f64],
+        composition: TabComposition,
+        tab_bin_m: f64,
+        tab_pour: bool,
+        corr_fn: &dyn Fn(usize, usize) -> f64,
+    ) -> Result<Option<SpineCsr>, KernelError> {
+        if composition == TabComposition::Off {
+            return Ok(None);
+        }
+        let membership = crate::census::via_patch_membership(filaments, tab_bin_m, tab_pour);
+        let vias: Vec<usize> = membership
+            .members
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|b| {
+                membership.patch_of_branch[*b].is_some()
+                    && filaments[*b].direction().z.abs() >= crate::census::VIA_IS_Z
+            })
+            .collect();
+        if vias.is_empty() {
+            return Ok(None);
+        }
+        let mut vias = vias;
+        vias.sort_unstable();
+        let radius = if tab_bin_m.is_finite() && tab_bin_m > 0.0 {
+            tab_bin_m
+        } else {
+            crate::census::derived_radius(filaments)
+        };
+        let all = crate::pfft::near_pairs_wanted(filaments, radius, &vias);
+        let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
+        let mut row_corr: Vec<Vec<f64>> = Vec::with_capacity(vias.len());
+        for (&via, list) in vias.iter().zip(&all) {
+            let mut row: Vec<(u32, f64)> = Vec::new();
+            for &partner in list {
+                let partner = partner as usize;
+                if partner == via {
+                    continue;
+                }
+                let src_patch = membership.patch_of_branch[via];
+                if src_patch.is_some() && src_patch == membership.patch_of_branch[partner] {
+                    continue;
+                }
+                if membership.patch_of_branch[partner].is_some() && partner < via {
+                    continue;
+                }
+                let mutual = inductance::mutual_inductance(&filaments[via], &filaments[partner])?;
+                row.push((partner as u32, mutual));
+            }
+            row.sort_by_key(|&(p, _)| p);
+            row_corr.push(
+                row.iter()
+                    .map(|&(p, _)| corr_fn(via, p as usize))
+                    .collect::<Vec<f64>>(),
+            );
+            slot_rows.push(row);
+        }
+        let mut row_ptr: Vec<u32> = Vec::with_capacity(vias.len() + 1);
+        row_ptr.push(0u32);
+        let mut col: Vec<u32> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        let mut corr: Vec<f64> = Vec::new();
+        for (row, corr_row) in slot_rows.iter().zip(&row_corr) {
+            for (&(partner, mutual), sub) in row.iter().zip(corr_row) {
+                col.push(partner);
+                values.push(mutual);
+                corr.push(*sub);
+            }
+            row_ptr.push(col.len() as u32);
+        }
+        Ok(Some(SpineCsr {
+            row_ptr,
+            col,
+            values,
+            jacobi: Vec::new(),
+            vias,
+            corr: Some(corr),
+        }))
+    }
+
+    /// The near half's flux: difference-kernel convolutions over the
+    /// family populations (the model's estimate) plus the tab/spine
+    /// substitution fluxes.
+    pub fn apply(&self, currents: &[f64], fluxes: &mut [f64]) {
+        assert_eq!(
+            currents.len(),
+            self.operator.place.len(),
+            "current vector must cover every branch"
+        );
+        assert_eq!(
+            fluxes.len(),
+            self.operator.place.len(),
+            "flux vector must cover every branch"
+        );
+        let n2 = self.operator.n * self.operator.n;
+        for value in fluxes.iter_mut() {
+            *value = 0.0;
+        }
+        let currents_c: Vec<Complex64> = currents.iter().map(|&v| Complex64::new(v, 0.0)).collect();
+        for (li, layer) in self.operator.layers.iter().enumerate() {
+            for (src_axis, population) in layer.filaments.iter().enumerate() {
+                if population.is_empty() {
+                    continue;
+                }
+                let mut field = vec![Complex64::new(0.0, 0.0); n2];
+                for &(branch, _) in population {
+                    let placed = self.operator.place[branch]
+                        .as_ref()
+                        .expect("populated branch placed");
+                    field[placed.cell] += Complex64::new(placed.sign * currents[branch], 0.0);
+                }
+                for (lj, victim) in self.operator.layers.iter().enumerate() {
+                    for (dst_axis, victims) in victim.filaments.iter().enumerate() {
+                        let Some(kernel) = &self.kernels[li][lj][src_axis][dst_axis] else {
+                            continue;
+                        };
+                        let mut convolved = field.clone();
+                        kernel.apply_forward(&mut convolved);
+                        for &(branch, _) in victims {
+                            let placed = self.operator.place[branch]
+                                .as_ref()
+                                .expect("populated branch placed");
+                            fluxes[branch] += placed.sign * convolved[placed.cell].re;
+                        }
+                    }
+                }
+            }
+        }
+        // Substitution stages in complex form (the tab/spine fluxes
+        // already read the corr values; zero omega on the hop since
+        // corr is real and the caller's AC lambda folds omega in).
+        let mut flux_re = vec![0.0f64; currents.len()];
+        let mut flux_im = vec![0.0f64; currents.len()];
+        for tab in &self.tabs {
+            tab.flux(&currents_c, &mut flux_re, &mut flux_im);
+        }
+        if let Some(spine) = &self.spine {
+            spine.flux(&currents_c, &mut flux_re, &mut flux_im);
+        }
+        for (dst, re) in fluxes.iter_mut().zip(&flux_re) {
+            *dst += *re;
+        }
+    }
+}
+
+impl std::fmt::Debug for MatvecCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatvecCore")
+            .field("layers", &self.operator.layers.len())
+            .field("tabs", &self.tabs.len())
+            .field(
+                "spine_slots",
+                &self.spine.as_ref().map_or(0, |s| s.vias.len()),
+            )
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod matvec_tests {
+    use super::*;
+
+    // The uniform-deck fixture lives in `layer_pair_tests` below; reuse
+    // it here by path.
+    use crate::conv::layer_pair_tests::{deck, PITCH};
+
+    /// The composed conv-matvec operator - far pFFT + difference-kernel
+    /// conv + tab/spine substitution - must reproduce every mutual the
+    /// precorrect operator computes, per pair, on the all-identical
+    /// uniform deck: the grid term of the difference kernel and the real
+    /// pairs share their pitch-aligned phase there, so the residual is
+    /// the synthetic-pair phase class (~1e-10 absolute, measured) and
+    /// the substitution stages (tab: the shared via cell incl. the
+    /// antiparallel twin; spine: the via) net to float noise. The
+    /// kernel stage must be linear per column (measured); the
+    /// composition is asserted column-wise against the precorrect
+    /// reference, plus one multi-source vector against the dense path.
+    #[test]
+    fn matvec_composition_matches_the_precorrect_per_pair() {
+        let deck = deck();
+        let params = crate::pfft::PfftParams::default();
+        let full = crate::pfft::PfftOperator::new(&deck, &params)
+            .expect("deck builds a precorrect operator");
+        let mut far_params = params;
+        far_params.precorrect_near = false;
+        let far =
+            crate::pfft::PfftOperator::new(&deck, &far_params).expect("deck builds a far operator");
+
+        let core = MatvecCore::build(
+            &far,
+            &deck,
+            TabComposition::Both,
+            PITCH,
+            true,
+            TabComposition::Both,
+        )
+        .expect("deck builds a matvec core");
+
+        // The reference (the precorrect operator) is the exact answer
+        // here, so the per-pair ceiling is the measured phase class.
+        let ceiling = 5e-10;
+        for j in 0..deck.len() {
+            let mut unit = vec![0.0f64; deck.len()];
+            unit[j] = 1.0;
+            let reference = full.apply(&unit);
+            let grid = far.apply(&unit);
+            let mut flux = vec![0.0f64; deck.len()];
+            core.apply(&unit, &mut flux);
+            for (i, total) in grid.iter().zip(&flux).map(|(g, f)| g + f).enumerate() {
+                assert!(
+                    (total - reference[i]).abs() <= ceiling,
+                    "composed pair ({i} <- {j}): total {total:e} exact {:e} \
+                     off the measured phase class",
+                    reference[i]
+                );
+            }
+        }
+
+        // Multi-source: signed currents across all branches.
+        let x: Vec<f64> = (0..deck.len())
+            .map(|i| {
+                if i % 3 == 0 {
+                    1.0
+                } else {
+                    -0.5 - 0.1 * i as f64
+                }
+            })
+            .collect();
+        let reference = full.apply(&x);
+        let grid = far.apply(&x);
+        let mut flux = vec![0.0f64; deck.len()];
+        core.apply(&x, &mut flux);
+        let mut worst = (0usize, 0.0f64);
+        for (i, total) in grid.iter().zip(&flux).map(|(g, f)| g + f).enumerate() {
+            let residual = (total - reference[i]).abs();
+            if residual > worst.1 {
+                worst = (i, residual);
+            }
+        }
+        // Twelve unit-ish sources, each pair inside the ceiling: the
+        // measured multi-source worst is ~2e-10 absolute.
+        assert!(
+            worst.1 <= 2.5e-9,
+            "multi-source composition residual {:e} at branch {} beyond the measured class",
+            worst.1,
+            worst.0
+        );
+        // PfftOperator::new records its phase on the global memgate
+        // governor; reset it so parallel in-crate tests (the memgate
+        // stage-name fixture) see the init stage.
+        crate::memgate::set_stage(crate::memgate::STAGE_INIT);
+    }
 }

@@ -66,8 +66,19 @@ pub fn rss_bytes() -> Option<u64> {
 mod tests {
     #[test]
     fn out_of_range_stage_is_ignored() {
+        // The stage is a global other in-crate tests concurrently
+        // write (operator builds record their phase), so no assertion
+        // may depend on what ran before this test. The properties
+        // owned here: an out-of-range write never panics and never
+        // de-indexes the name table; an in-range write reads back
+        // exactly what was set.
+        let before = super::stage_name();
         super::set_stage(999);
-        assert_eq!(super::stage_name(), "solver initialization");
+        assert_eq!(
+            super::stage_name(),
+            before,
+            "an out-of-range write must be a no-op between these two reads"
+        );
         super::set_stage(super::STAGE_GMRES);
         assert_eq!(super::stage_name(), super::STAGE_NAMES[3]);
         super::set_stage(super::STAGE_INIT);

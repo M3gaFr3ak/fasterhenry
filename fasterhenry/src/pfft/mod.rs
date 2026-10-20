@@ -210,6 +210,16 @@ pub struct PfftParams {
     /// points per axis (`1` is trilinear). Far-field error falls as
     /// `(h/d)^(p+1)`. Default: [`DEFAULT_INTERPOLATION_ORDER`].
     pub interpolation_order: usize,
+    /// Whether the near band is precorrected (exact kernels stored per
+    /// near pair). Default `true` = the historical operator. `false`
+    /// builds the FAR-ONLY operator (no near pairs enumerated or
+    /// stored at all: the apply keeps every pair's grid approximation,
+    /// close ones included) - the operator for the conv-matvec
+    /// composition, where the near band is owned by the conv model
+    /// (see the increment-5 decision in the peec books). The engine's
+    /// `FASTERHENRY_CONV_MATVEC` path answers for that flag; the pFFT
+    /// crate never flips it itself.
+    pub precorrect_near: bool,
 }
 
 /// Default `cells_per_filament` of [`GridSpacing::Auto`]. Accuracy hardly
@@ -231,6 +241,7 @@ impl Default for PfftParams {
             },
             near_field_radius: DEFAULT_NEAR_FIELD_RADIUS,
             interpolation_order: DEFAULT_INTERPOLATION_ORDER,
+            precorrect_near: true,
         }
     }
 }
@@ -432,22 +443,34 @@ impl PfftOperator {
         // truth before the (potentially enormous) pair+scratch
         // allocations - the same mid-run refusal policy the OOM
         // governor enforces, moved to pre-flight where it is honest.
+        // The far-only mode (`precorrect_near = false`) skips all of
+        // this: its census total is the FFT half alone, and the near
+        // band is owned downstream (the conv-matvec composition).
         let radius = params.near_field_radius * spacing;
-        let near_rows = near::near_pairs_count(filaments, radius);
-        let pairs_est: usize = near_rows.iter().map(|&c| c as usize).sum();
-        let pairs_bytes = 24usize.saturating_mul(pairs_est);
-        let pairs_gb = pairs_bytes as f64 / 1e9;
-        let census_gb = fft_gb + pairs_gb;
-        eprintln!(
-            "pfft: near-field census: {} rows, {} directed pairs, exact ({:.1} GB at 24 B/pair)",
-            near_rows.len(),
-            pairs_est,
-            pairs_gb,
-        );
-        eprintln!(
-            "pfft: census total: grid {:?}, padded {} pts, FFT ~{:.1} GB + near pairs ~{:.1} GB = ~{:.1} GB",
-            grid.dims, padded, fft_gb, pairs_gb, census_gb,
-        );
+        let (pairs_gb, census_gb, pairs_est) = if params.precorrect_near {
+            let near_rows = near::near_pairs_count(filaments, radius);
+            let pair_estimate: usize = near_rows.iter().map(|&c| c as usize).sum();
+            let pair_bytes = 24usize.saturating_mul(pair_estimate);
+            let pair_gb = pair_bytes as f64 / 1e9;
+            let total_gb = fft_gb + pair_gb;
+            eprintln!(
+                "pfft: near-field census: {} rows, {} directed pairs, exact ({:.1} GB at 24 B/pair)",
+                near_rows.len(),
+                pair_estimate,
+                pair_gb,
+            );
+            eprintln!(
+                "pfft: census total: grid {:?}, padded {} pts, FFT ~{:.1} GB + near pairs ~{:.1} GB = ~{:.1} GB",
+                grid.dims, padded, fft_gb, pair_gb, total_gb,
+            );
+            (pair_gb, total_gb, pair_estimate as f64)
+        } else {
+            eprintln!(
+                "pfft: far-only operator (precorrect_near=false): census total = FFT ~{fft_gb:.1} GB (grid {:?}, padded {} pts); near band owned downstream (conv-matvec), no pair enumeration",
+                grid.dims, padded,
+            );
+            (0.0, fft_gb, 0.0)
+        };
         if let Ok(budget) = std::env::var("FASTERHENRY_MEMORY_BUDGET_GB") {
             let budget: f64 = budget.trim().parse::<f64>().map_err(|_| {
                 PfftError::InvalidParameter(
@@ -480,19 +503,27 @@ impl PfftOperator {
         }
         eprintln!("pfft: projecting {} filaments to the grid ...", n);
         let projections = grid::project_all(&grid, filaments, radius);
-        eprintln!("pfft: enumerating near-field pairs ...");
-        crate::memgate::set_stage(crate::memgate::STAGE_PFFT_OPERATOR);
-        let pairs = near::near_pairs(filaments, radius);
-        let pair_total: usize = pairs.iter().map(|row| row.len()).sum();
-        eprintln!(
-            "pfft: near-field census: {} neighbor rows, {} directed pairs, exact ({:.1} GB at 24 B/pair; budget {})",
-            pairs.len(),
-            pair_total,
-            24.0 * pair_total as f64 / 1e9,
-            std::env::var("FASTERHENRY_MEMORY_BUDGET_GB").unwrap_or_else(|_| "none".to_string()),
-        );
-        eprintln!("pfft: precorrecting near-field (exact kernels) ...");
-        let near = near::precorrect(filaments, &grid, &projections, &pairs)?;
+        let near = if params.precorrect_near {
+            eprintln!("pfft: enumerating near-field pairs ...");
+            crate::memgate::set_stage(crate::memgate::STAGE_PFFT_OPERATOR);
+            let pairs = near::near_pairs(filaments, radius);
+            let pair_total: usize = pairs.iter().map(|row| row.len()).sum();
+            eprintln!(
+                "pfft: near-field census: {} neighbor rows, {} directed pairs, exact ({:.1} GB at 24 B/pair; budget {})",
+                pairs.len(),
+                pair_total,
+                24.0 * pair_total as f64 / 1e9,
+                std::env::var("FASTERHENRY_MEMORY_BUDGET_GB").unwrap_or_else(|_| "none".to_string()),
+            );
+            eprintln!("pfft: precorrecting near-field (exact kernels) ...");
+            near::precorrect(filaments, &grid, &projections, &pairs)?
+        } else {
+            near::NearField {
+                offsets: vec![0; n + 1],
+                columns: Vec::new(),
+                values: Vec::new(),
+            }
+        };
 
         let mut projection_offsets = Vec::with_capacity(n + 1);
         projection_offsets.push(0);
@@ -580,6 +611,77 @@ impl PfftOperator {
     /// cells times the operator's own grid spacing).
     pub fn near_radius(&self) -> f64 {
         self.near_radius
+    }
+
+    /// The grid's valid placement box for a synthetic pair's centres:
+    /// `Grid::new` pads the origin by one stencil half-width, so a
+    /// filament centred inside `[origin + pad, hi - pad]` projects in
+    /// full. Synthetic pairs sampled OUTSIDE (the difference kernel's
+    /// negative displacements) would carry truncated stencils - silent
+    /// garbage - so the samplers translate their pairs into this box.
+    /// `None` when the operator carries no grid (far-off posture).
+    pub(crate) fn grid_box(&self) -> Option<(Vector3<f64>, Vector3<f64>)> {
+        let grid = self.grid.as_ref()?;
+        let pad = grid.stencil.div_ceil(2) as f64 * grid.spacing;
+        let hi = grid.origin
+            + Vector3::new(
+                (grid.dims[0] - 1) as f64 * grid.spacing,
+                (grid.dims[1] - 1) as f64 * grid.spacing,
+                (grid.dims[2] - 1) as f64 * grid.spacing,
+            );
+        Some((
+            grid.origin + Vector3::repeat(pad),
+            hi - Vector3::repeat(pad),
+        ))
+    }
+
+    /// The grid's own per-pair estimate of the mutual inductance of two
+    /// filaments: the closed-form double sum over both projection
+    /// stencils, exactly the value the spread-convolve-gather path
+    /// returns for the pair (linear superposition of the grid kernel
+    /// `1/(h r)` over both stencils), evaluated without an FFT.
+    ///
+    /// This is the conv-matvec difference kernel's subtraction term:
+    /// `Kdiff(u) = L_exact(synthetic pair at u) - pair_grid_estimate(same
+    /// pair)`, and the tab/spine substitution stages' per-pair
+    /// `negation` - see the increment-5 decision in the peec books.
+    /// The grid's own per-pair estimate of the mutual inductance of two
+    /// filaments: the closed-form double sum over both projection
+    /// stencils, exactly the value the spread-convolve-gather path
+    /// returns for the pair (linear superposition of the grid kernel
+    /// `1/(h r)` over both stencils), evaluated without an FFT. The
+    /// physics rides the same factors as the far path and the
+    /// precorrection's `exact - MU0_OVER_4PI * cos * approx` split
+    /// (`near.rs::row`): `MU0_OVER_4PI` times the direction cosine of
+    /// the pair times the bare double sum.
+    pub fn pair_grid_estimate(&self, src: &Filament, dst: &Filament) -> f64 {
+        let Some(grid) = &self.grid else {
+            return 0.0;
+        };
+        let pair = [src.clone(), dst.clone()];
+        let projections = grid::project_all(grid, &pair, self.near_radius);
+        let mut total = 0.0;
+        for &(g, sw) in &projections[0].entries {
+            let sg = grid.point(g as usize);
+            for &(h, dw) in &projections[1].entries {
+                let hg = grid.point(h as usize);
+                let offset = [
+                    hg[0] as i64 - sg[0] as i64,
+                    hg[1] as i64 - sg[1] as i64,
+                    hg[2] as i64 - sg[2] as i64,
+                ];
+                let r2 =
+                    (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]) as f64;
+                // Same-cell interactions carry zero grid kernel (the
+                // near-stage kernel's own zero rule).
+                if r2 == 0.0 {
+                    continue;
+                }
+                total += sw * dw / (grid.spacing * r2.sqrt());
+            }
+        }
+        let cos = src.direction().dot(&dst.direction());
+        MU0_OVER_4PI * cos * total
     }
 
     /// Number of filaments, the dimension of `L`.
