@@ -237,6 +237,10 @@ impl NearBins {
             (other == index && upper_only)
                 || separation(&self.bars[index], &self.bars[other]) < self.radius
         });
+        // The pre-retain candidate flood (every bar in every touched bin,
+        // pre-dedup) dwarfed the retained list on dense hatch pours and
+        // stayed resident across a `wanted` scan - capacity to retained size.
+        found.shrink_to_fit();
         found
     }
 }

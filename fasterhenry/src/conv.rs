@@ -2581,9 +2581,9 @@ impl MatvecCore {
         let row_total = vias.len();
         let mut next_report_at = std::time::Duration::from_secs(60);
         let mut pairs_done: usize = 0;
-        for (row_id, (&via, list)) in vias.iter().zip(&all).enumerate() {
+        for (row_id, (&via, list)) in vias.iter().zip(all).enumerate() {
             let mut row: Vec<(u32, f64)> = Vec::new();
-            for &partner in list {
+            for partner in list {
                 let partner = partner as usize;
                 if partner == via {
                     continue;
