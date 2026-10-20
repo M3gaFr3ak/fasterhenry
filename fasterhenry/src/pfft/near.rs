@@ -133,7 +133,7 @@ pub(crate) struct NearBins {
 }
 
 impl NearBins {
-    fn build(filaments: &[Filament], radius: f64) -> Self {
+    pub(crate) fn build(filaments: &[Filament], radius: f64) -> Self {
         let n = filaments.len();
         let bars: Vec<Bar> = filaments.iter().map(Bar::new).collect();
         let mut lo = match bars.first() {
@@ -196,7 +196,7 @@ impl NearBins {
     /// separated by real 3D distance. `upper_only` keeps the original
     /// scan's j >= index with self included; `false` keeps every
     /// direction (self excluded - the wanted variant's semantics).
-    fn candidates_for(&self, index: usize, upper_only: bool) -> Vec<u32> {
+    pub(crate) fn candidates_for(&self, index: usize, upper_only: bool) -> Vec<u32> {
         let (a, b) = bounds(&self.bars[index]);
         let grow = Vector3::repeat(self.radius);
         let cell = |x: f64, axis: usize| {

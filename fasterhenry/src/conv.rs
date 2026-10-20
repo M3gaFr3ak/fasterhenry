@@ -2518,13 +2518,13 @@ impl MatvecCore {
     /// Builds the substitution-form spine (mirrors the smoother's
     /// construction; the `Both` Jacobi stage is smoother-only, empty
     /// here).
-    fn build_spine(
+    fn build_spine<F: Fn(usize, usize) -> f64 + Sync>(
         filaments: &[Filament],
         _resistances: &[f64],
         composition: TabComposition,
         tab_bin_m: f64,
         tab_pour: bool,
-        corr_fn: &dyn Fn(usize, usize) -> f64,
+        corr_fn: &F,
     ) -> Result<Option<SpineCsr>, KernelError> {
         if composition == TabComposition::Off {
             return Ok(None);
@@ -2569,69 +2569,169 @@ impl MatvecCore {
             crate::census::derived_radius(filaments)
         };
         let spine_start = std::time::Instant::now();
-        let all = crate::pfft::near_pairs_wanted(filaments, radius, &vias);
-        let wanted_pairs: usize = all.iter().map(Vec::len).sum();
-        eprintln!(
-            "matvec: spine: {} via rows at partner radius {:.3e} m, partner pairs {}, scan done (t {:.1} s)",
-            vias.len(),
-            radius,
-            wanted_pairs,
-            spine_start.elapsed().as_secs_f64(),
-        );
-        let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
-        let mut row_corr: Vec<Vec<f64>> = Vec::with_capacity(vias.len());
-        let row_total = vias.len();
-        let mut next_report_at = std::time::Duration::from_secs(60);
-        let mut pairs_done: usize = 0;
-        for (row_id, (&via, list)) in vias.iter().zip(all).enumerate() {
-            let mut row: Vec<(u32, f64)> = Vec::new();
-            for partner in list {
-                let partner = partner as usize;
-                if partner == via {
-                    continue;
-                }
+        use rayon::prelude::*;
+        let bins = crate::pfft::near::NearBins::build(filaments, radius);
+        // Count pass: exact CSR sizes, the SAME per-row filters the
+        // fill applies (drop self, same-patch members, the lower half
+        // of member patches), so the fill can never drift off its
+        // slot. The intermediate slot arrays of the previous design
+        // duplicated the whole spine (lists + rows + corr + CSR); the
+        // m1/m2 refusals at ~57 GB were that duplication plus pair
+        // volume, so both passes now walk the CSR only.
+        let counts: Vec<u32> = vias
+            .par_iter()
+            .map(|&via| {
+                let list = bins.candidates_for(via, false);
                 let src_patch = membership.patch_of_branch[via];
-                if src_patch.is_some() && src_patch == membership.patch_of_branch[partner] {
-                    continue;
-                }
-                if membership.patch_of_branch[partner].is_some() && partner < via {
-                    continue;
-                }
-                let mutual = inductance::mutual_inductance(&filaments[via], &filaments[partner])?;
-                row.push((partner as u32, mutual));
-            }
-            row.sort_by_key(|&(p, _)| p);
-            row_corr.push(
-                row.iter()
-                    .map(|&(p, _)| corr_fn(via, p as usize))
-                    .collect::<Vec<f64>>(),
-            );
-            pairs_done += row.len();
-            if spine_start.elapsed() >= next_report_at {
-                eprintln!(
-                    "matvec: spine: row {}/{}, partner pairs {} (t {:.1} s)",
-                    row_id + 1,
-                    row_total,
-                    pairs_done,
-                    spine_start.elapsed().as_secs_f64(),
-                );
-                next_report_at += std::time::Duration::from_secs(60);
-            }
-            slot_rows.push(row);
-        }
+                list.iter()
+                    .filter(|&&partner| {
+                        let partner = partner as usize;
+                        partner != via
+                            && !(src_patch.is_some()
+                                && src_patch == membership.patch_of_branch[partner])
+                            && !(membership.patch_of_branch[partner].is_some() && partner < via)
+                    })
+                    .count() as u32
+            })
+            .collect();
         let mut row_ptr: Vec<u32> = Vec::with_capacity(vias.len() + 1);
         row_ptr.push(0u32);
-        let mut col: Vec<u32> = Vec::new();
-        let mut values: Vec<f64> = Vec::new();
-        let mut corr: Vec<f64> = Vec::new();
-        for (row, corr_row) in slot_rows.iter().zip(&row_corr) {
-            for (&(partner, mutual), sub) in row.iter().zip(corr_row) {
-                col.push(partner);
-                values.push(mutual);
-                corr.push(*sub);
-            }
-            row_ptr.push(col.len() as u32);
+        for count in &counts {
+            row_ptr.push(row_ptr.last().copied().unwrap_or(0) + count);
         }
+        let total_pairs = row_ptr.last().copied().unwrap_or(0) as usize;
+        assert!(
+            total_pairs <= u32::MAX as usize,
+            "spine partner pairs {} exceed the CSR u32 row range",
+            total_pairs
+        );
+        eprintln!(
+            "matvec: spine: {} via rows at partner radius {:.3e} m, partner pairs {}, count pass done (t {:.1} s)",
+            vias.len(),
+            radius,
+            total_pairs,
+            spine_start.elapsed().as_secs_f64(),
+        );
+        let mut col: Vec<u32> = vec![0u32; total_pairs];
+        let mut values: Vec<f64> = vec![0.0f64; total_pairs];
+        let mut corr: Vec<f64> = vec![0.0f64; total_pairs];
+        // Per-thread CSR chunks, split sequentially up front so the
+        // disjoint borrows are visible without unsafe (rayon's
+        // `for_each` takes Fn, no &mut capture, and the crate forbids
+        // unsafe; atomic cells would add a conversion copy). One
+        // chunk is popped per thread; the per-row work (mutual + corr
+        // evaluations over ~1e3-1e4 partners) is the spine's real
+        // cost, so it runs in parallel.
+        struct ThreadChunk<'a> {
+            col: &'a mut [u32],
+            values: &'a mut [f64],
+            corr: &'a mut [f64],
+            /// row_ptr[lo..=hi] as the thread's own view.
+            rows: Vec<u32>,
+            /// First global row id of the chunk (for tick prints).
+            lo: usize,
+        }
+        let rows = vias.len();
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let mut chunks: Vec<ThreadChunk> = Vec::with_capacity(threads);
+        {
+            let mut col_rest = &mut col[..];
+            let mut values_rest = &mut values[..];
+            let mut corr_rest = &mut corr[..];
+            for thread_id in 0..threads {
+                let lo = rows * thread_id / threads;
+                let hi = rows * (thread_id + 1) / threads;
+                let base = row_ptr[0] as usize;
+                let rel_lo = row_ptr[lo] as usize - base;
+                let rel_hi = row_ptr[hi] as usize - base;
+                let (col_take, col_next) = col_rest.split_at_mut(rel_hi);
+                let (values_take, values_next) = values_rest.split_at_mut(rel_hi);
+                let (corr_take, corr_next) = corr_rest.split_at_mut(rel_hi);
+                chunks.push(ThreadChunk {
+                    col: &mut col_take[rel_lo..],
+                    values: &mut values_take[rel_lo..],
+                    corr: &mut corr_take[rel_lo..],
+                    rows: row_ptr[lo..=hi].to_vec(),
+                    lo,
+                });
+                col_rest = col_next;
+                values_rest = values_next;
+                corr_rest = corr_next;
+            }
+        }
+        let pairs_done = std::sync::atomic::AtomicI64::new(0);
+        let next_report = std::sync::atomic::AtomicI64::new(60);
+        std::thread::scope(|scope| {
+            while let Some(chunk) = chunks.pop() {
+                let bins = &bins;
+                let vias = &vias;
+                let membership = &membership;
+                let pairs_done = &pairs_done;
+                let next_report = &next_report;
+                let corr = corr_fn;
+                scope.spawn(move || {
+                    for row_id in 0..chunk.rows.len() - 1 {
+                        let via = vias[chunk.lo + row_id];
+                        let start = (chunk.rows[row_id] - chunk.rows[0]) as usize;
+                        let end = (chunk.rows[row_id + 1] - chunk.rows[0]) as usize;
+                        let list = bins.candidates_for(via, false);
+                        let src_patch = membership.patch_of_branch[via];
+                        let mut row: Vec<(u32, f64)> = Vec::with_capacity(list.len());
+                        for partner in list {
+                            let partner = partner as usize;
+                            if partner == via {
+                                continue;
+                            }
+                            if src_patch.is_some()
+                                && src_patch == membership.patch_of_branch[partner]
+                            {
+                                continue;
+                            }
+                            if membership.patch_of_branch[partner].is_some() && partner < via {
+                                continue;
+                            }
+                            let mutual =
+                                inductance::mutual_inductance(&filaments[via], &filaments[partner])
+                                    .expect("spine partner pair has incompatible geometry");
+                            row.push((partner as u32, mutual));
+                        }
+                        row.sort_unstable_by_key(|&(p, _)| p);
+                        assert_eq!(
+                            row.len(),
+                            end - start,
+                            "spine count pass drifted from the fill"
+                        );
+                        for (slot, &(partner, mutual)) in row.iter().enumerate() {
+                            chunk.col[start + slot] = partner;
+                            chunk.values[start + slot] = mutual;
+                            chunk.corr[start + slot] = corr(via, partner as usize);
+                        }
+                        pairs_done
+                            .fetch_add(row.len() as i64, std::sync::atomic::Ordering::Relaxed);
+                        let elapsed = spine_start.elapsed().as_secs() as i64;
+                        let next = next_report.load(std::sync::atomic::Ordering::Relaxed);
+                        if elapsed >= next
+                            && next_report
+                                .compare_exchange(
+                                    next,
+                                    next + 60,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                )
+                                .is_ok()
+                        {
+                            eprintln!(
+                                "matvec: spine: row {}/{}, partner pairs {} (t {:.1} s)",
+                                chunk.lo + row_id + 1,
+                                rows,
+                                pairs_done.load(std::sync::atomic::Ordering::Relaxed),
+                                spine_start.elapsed().as_secs_f64(),
+                            );
+                        }
+                    }
+                });
+            }
+        });
         Ok(Some(SpineCsr {
             row_ptr,
             col,
