@@ -379,6 +379,7 @@ pub fn via_patch_membership(
     bin_m: f64,
     pour_members: bool,
 ) -> ViaMembership {
+    let stamp = std::time::Instant::now();
     let bin = if bin_m.is_finite() && bin_m > 0.0 {
         bin_m
     } else {
@@ -457,6 +458,13 @@ pub fn via_patch_membership(
             }
         }
     }
+    eprintln!(
+        "census: via membership: {} patches, {} members, {} z branches (t {:.1} s)",
+        patch_count,
+        members.iter().map(|m| m.len()).sum::<usize>(),
+        via_branches,
+        stamp.elapsed().as_secs_f64(),
+    );
     ViaMembership {
         members,
         patch_of_branch: block_of_branch,

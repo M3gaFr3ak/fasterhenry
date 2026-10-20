@@ -2287,7 +2287,15 @@ impl MatvecCore {
         tab_pour: bool,
         spine_composition: TabComposition,
     ) -> Result<Self, KernelError> {
+        let build_start = std::time::Instant::now();
         let operator = LayerPairOperator::build(filaments)?;
+        eprintln!(
+            "matvec: layer operator: {} layers, raster {} cells, pitch {:.3e} m (t {:.1} s)",
+            operator.layers.len(),
+            operator.raster(),
+            operator.pitch(),
+            build_start.elapsed().as_secs_f64(),
+        );
         let layer_count = operator.layer_count();
         // Near-band half width, in cells: the diff table's support.
         // Three caps stack: the pFFT's own near radius (the posture's
@@ -2342,6 +2350,14 @@ impl MatvecCore {
                             band_cells,
                             li == lj && src_axis == dst_axis,
                         )?;
+                        eprintln!(
+                            "matvec: kernel layer pair [{},{}] axis [{},{}] sampled (t {:.1} s)",
+                            li,
+                            lj,
+                            src_axis,
+                            dst_axis,
+                            build_start.elapsed().as_secs_f64(),
+                        );
                         families[src_axis][dst_axis] = Some(kernel);
                     }
                 }
@@ -2401,6 +2417,11 @@ impl MatvecCore {
                 tab_pour,
                 &corr_fn,
             )?;
+            eprintln!(
+                "matvec: tabs built: {} blocks (t {:.1} s)",
+                tabs.len(),
+                build_start.elapsed().as_secs_f64(),
+            );
             let spine = Self::build_spine(
                 filaments,
                 &[],
@@ -2409,15 +2430,20 @@ impl MatvecCore {
                 tab_pour,
                 &corr_fn,
             )?;
+            eprintln!(
+                "matvec: spine built (t {:.1} s)",
+                build_start.elapsed().as_secs_f64(),
+            );
             (tabs, spine)
         };
         eprintln!(
-            "matvec: conv-matvec operator: {} layer pair families, band {} cells at pitch {:.3e} m, {} tab blocks, spine {}",
+            "matvec: conv-matvec operator: {} layer pair families, band {} cells at pitch {:.3e} m, {} tab blocks, spine {} (t {:.1} s)",
             operator.layers.len(),
             band_cells,
             operator.pitch(),
             tabs.len(),
             spine.as_ref().map_or(0, |s| s.vias.len()),
+            build_start.elapsed().as_secs_f64(),
         );
         Ok(Self {
             operator,
@@ -2443,8 +2469,11 @@ impl MatvecCore {
             return Ok(Vec::new());
         }
         let membership = crate::census::via_patch_membership(filaments, tab_bin_m, tab_pour);
+        let block_total = membership.members.len();
+        let report = (block_total / 20).max(1);
+        let tabs_start = std::time::Instant::now();
         let mut blocks = Vec::new();
-        for members in membership.members {
+        for (block_id, members) in membership.members.into_iter().enumerate() {
             let count = members.len();
             if count == 0 {
                 continue;
@@ -2469,6 +2498,14 @@ impl MatvecCore {
                     .flat_map(|row| (0..count).map(move |col| corr_fn(indices[row], indices[col])))
                     .collect::<Vec<f64>>()
             };
+            if (block_id + 1) % report == 0 {
+                eprintln!(
+                    "matvec: tabs: block {}/{} (t {:.1} s)",
+                    block_id + 1,
+                    block_total,
+                    tabs_start.elapsed().as_secs_f64(),
+                );
+            }
             blocks.push(TabBlock::build(members, l, &[], 0.0, false, Some(corr)));
         }
         Ok(blocks)
@@ -2509,10 +2546,18 @@ impl MatvecCore {
         } else {
             crate::census::derived_radius(filaments)
         };
+        let spine_start = std::time::Instant::now();
         let all = crate::pfft::near_pairs_wanted(filaments, radius, &vias);
+        eprintln!(
+            "matvec: spine: {} via rows, partner scan done (t {:.1} s)",
+            vias.len(),
+            spine_start.elapsed().as_secs_f64(),
+        );
         let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
         let mut row_corr: Vec<Vec<f64>> = Vec::with_capacity(vias.len());
-        for (&via, list) in vias.iter().zip(&all) {
+        let row_total = vias.len();
+        let report = (row_total / 20).max(1);
+        for (row_id, (&via, list)) in vias.iter().zip(&all).enumerate() {
             let mut row: Vec<(u32, f64)> = Vec::new();
             for &partner in list {
                 let partner = partner as usize;
@@ -2535,6 +2580,14 @@ impl MatvecCore {
                     .map(|&(p, _)| corr_fn(via, p as usize))
                     .collect::<Vec<f64>>(),
             );
+            if (row_id + 1) % report == 0 {
+                eprintln!(
+                    "matvec: spine: row {}/{} (t {:.1} s)",
+                    row_id + 1,
+                    row_total,
+                    spine_start.elapsed().as_secs_f64(),
+                );
+            }
             slot_rows.push(row);
         }
         let mut row_ptr: Vec<u32> = Vec::with_capacity(vias.len() + 1);
