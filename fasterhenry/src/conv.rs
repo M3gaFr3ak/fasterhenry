@@ -2570,10 +2570,12 @@ impl MatvecCore {
         };
         let spine_start = std::time::Instant::now();
         let all = crate::pfft::near_pairs_wanted(filaments, radius, &vias);
+        let wanted_pairs: usize = all.iter().map(Vec::len).sum();
         eprintln!(
-            "matvec: spine: {} via rows at partner radius {:.3e} m, partner scan done (t {:.1} s)",
+            "matvec: spine: {} via rows at partner radius {:.3e} m, partner pairs {}, scan done (t {:.1} s)",
             vias.len(),
             radius,
+            wanted_pairs,
             spine_start.elapsed().as_secs_f64(),
         );
         let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
