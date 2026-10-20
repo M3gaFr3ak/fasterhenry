@@ -2470,8 +2470,9 @@ impl MatvecCore {
         }
         let membership = crate::census::via_patch_membership(filaments, tab_bin_m, tab_pour);
         let block_total = membership.members.len();
-        let report = (block_total / 20).max(1);
         let tabs_start = std::time::Instant::now();
+        let mut next_report_at = std::time::Duration::from_secs(60);
+        let mut pairs_done: usize = 0;
         let mut blocks = Vec::new();
         for (block_id, members) in membership.members.into_iter().enumerate() {
             let count = members.len();
@@ -2498,13 +2499,16 @@ impl MatvecCore {
                     .flat_map(|row| (0..count).map(move |col| corr_fn(indices[row], indices[col])))
                     .collect::<Vec<f64>>()
             };
-            if (block_id + 1) % report == 0 {
+            pairs_done += count * count;
+            if tabs_start.elapsed() >= next_report_at {
                 eprintln!(
-                    "matvec: tabs: block {}/{} (t {:.1} s)",
+                    "matvec: tabs: block {}/{}, member pairs {} (t {:.1} s)",
                     block_id + 1,
                     block_total,
+                    pairs_done,
                     tabs_start.elapsed().as_secs_f64(),
                 );
+                next_report_at += std::time::Duration::from_secs(60);
             }
             blocks.push(TabBlock::build(members, l, &[], 0.0, false, Some(corr)));
         }
@@ -2556,7 +2560,8 @@ impl MatvecCore {
         let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
         let mut row_corr: Vec<Vec<f64>> = Vec::with_capacity(vias.len());
         let row_total = vias.len();
-        let report = (row_total / 20).max(1);
+        let mut next_report_at = std::time::Duration::from_secs(60);
+        let mut pairs_done: usize = 0;
         for (row_id, (&via, list)) in vias.iter().zip(&all).enumerate() {
             let mut row: Vec<(u32, f64)> = Vec::new();
             for &partner in list {
@@ -2580,13 +2585,16 @@ impl MatvecCore {
                     .map(|&(p, _)| corr_fn(via, p as usize))
                     .collect::<Vec<f64>>(),
             );
-            if (row_id + 1) % report == 0 {
+            pairs_done += row.len();
+            if spine_start.elapsed() >= next_report_at {
                 eprintln!(
-                    "matvec: spine: row {}/{} (t {:.1} s)",
+                    "matvec: spine: row {}/{}, partner pairs {} (t {:.1} s)",
                     row_id + 1,
                     row_total,
+                    pairs_done,
                     spine_start.elapsed().as_secs_f64(),
                 );
+                next_report_at += std::time::Duration::from_secs(60);
             }
             slot_rows.push(row);
         }
