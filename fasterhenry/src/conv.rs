@@ -565,7 +565,18 @@ impl LayerPairOperator {
             !points.is_empty(),
             "layer-pair operator: no manhattan filaments"
         );
-        let cell_m = modal_pitch(&points);
+        let cell_m = match std::env::var("FASTERHENRY_CONV_RASTER_PITCH") {
+            Ok(text) => match text.trim().parse::<f64>() {
+                Ok(value) if value.is_finite() && value > 0.0 => value,
+                _ => {
+                    eprintln!(
+                        "conv: warning: FASTERHENRY_CONV_RASTER_PITCH={text:?} is not a positive finite number of meters - falling through to the modal-pitch estimate (a raster pitch is precond cost, never the answer)",
+                    );
+                    modal_pitch(&points)
+                }
+            },
+            Err(_) => modal_pitch(&points),
+        };
 
         // Raster geometry: the covered centres' bbox plus a margin of
         // four cells per side (wrap hygiene), side capped loudly.
@@ -583,7 +594,7 @@ impl LayerPairOperator {
         let side = span_cells(lo[0], hi[0]).max(span_cells(lo[1], hi[1])) + 2 * MARGIN_CELLS;
         assert!(
             side <= MAX_SIDE as i64,
-            "layer-pair raster side {side} exceeds the {MAX_SIDE} cap - coarsen the pitch knob"
+            "layer-pair raster side {side} exceeds the {MAX_SIDE} cap - set FASTERHENRY_CONV_RASTER_PITCH (meters) to coarsen the cell",
         );
         let n = (side as usize).max(3);
         // Cell indexing MUST match the kernel raster's convention:
