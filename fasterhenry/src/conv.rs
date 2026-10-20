@@ -2545,7 +2545,25 @@ impl MatvecCore {
         }
         let mut vias = vias;
         vias.sort_unstable();
-        let radius = if tab_bin_m.is_finite() && tab_bin_m > 0.0 {
+        let mut radius = match std::env::var("FASTERHENRY_SPINE_RADIUS_M")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some(text) => match text.parse::<f64>() {
+                Ok(value) if value.is_finite() && value > 0.0 => value,
+                _ => {
+                    eprintln!(
+                        "conv: warning: FASTERHENRY_SPINE_RADIUS_M={text:?} not a positive number; falling back to the census bin"
+                    );
+                    0.0
+                }
+            },
+            None => 0.0,
+        };
+        radius = if radius > 0.0 {
+            radius
+        } else if tab_bin_m.is_finite() && tab_bin_m > 0.0 {
             tab_bin_m
         } else {
             crate::census::derived_radius(filaments)
@@ -2553,8 +2571,9 @@ impl MatvecCore {
         let spine_start = std::time::Instant::now();
         let all = crate::pfft::near_pairs_wanted(filaments, radius, &vias);
         eprintln!(
-            "matvec: spine: {} via rows, partner scan done (t {:.1} s)",
+            "matvec: spine: {} via rows at partner radius {:.3e} m, partner scan done (t {:.1} s)",
             vias.len(),
+            radius,
             spine_start.elapsed().as_secs_f64(),
         );
         let mut slot_rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(vias.len());
