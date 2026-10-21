@@ -2641,16 +2641,19 @@ impl MatvecCore {
             for thread_id in 0..threads {
                 let lo = rows * thread_id / threads;
                 let hi = rows * (thread_id + 1) / threads;
-                let base = row_ptr[0] as usize;
-                let rel_lo = row_ptr[lo] as usize - base;
-                let rel_hi = row_ptr[hi] as usize - base;
-                let (col_take, col_next) = col_rest.split_at_mut(rel_hi);
-                let (values_take, values_next) = values_rest.split_at_mut(rel_hi);
-                let (corr_take, corr_next) = corr_rest.split_at_mut(rel_hi);
+                // The rest slices advance by the ABSOLUTE offsets
+                // already consumed, so each split length is this
+                // thread's segment size, not the absolute index: the
+                // m4 panic (mid > len) split the remainder at
+                // row_ptr[hi] - base for every thread.
+                let seg = row_ptr[hi] as usize - row_ptr[lo] as usize;
+                let (col_take, col_next) = col_rest.split_at_mut(seg);
+                let (values_take, values_next) = values_rest.split_at_mut(seg);
+                let (corr_take, corr_next) = corr_rest.split_at_mut(seg);
                 chunks.push(ThreadChunk {
-                    col: &mut col_take[rel_lo..],
-                    values: &mut values_take[rel_lo..],
-                    corr: &mut corr_take[rel_lo..],
+                    col: col_take,
+                    values: values_take,
+                    corr: corr_take,
                     rows: row_ptr[lo..=hi].to_vec(),
                     lo,
                 });
