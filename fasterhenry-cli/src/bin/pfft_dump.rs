@@ -30,12 +30,32 @@ struct VecJson {
     y: Vec<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
+struct Counts {
+    #[serde(rename = "orthogonal")]
+    orthogonal: usize,
+    #[serde(rename = "bar_closed_form")]
+    bar_closed_form: usize,
+    #[serde(rename = "aligned_quadrature")]
+    aligned_quadrature: usize,
+    #[serde(rename = "point_quadrature")]
+    point_quadrature: usize,
+    #[serde(rename = "sampled_filaments")]
+    sampled_filaments: usize,
+}
+
+#[derive(Serialize, Default)]
 struct Dump {
     n: usize,
     filaments_head: Vec<FilJson>,
     filaments_tail: Vec<FilJson>,
     vectors: Vec<VecJson>,
+    /// Fork-native dense inductance matrix (row-major, n x n), SI henries:
+    /// the kernel ground truth for the spike's Julia port. Erroring pairs
+    /// get their MATLAB-safe NaN marker.
+    dense: Vec<f64>,
+    /// Dispatch-path distribution over the same pairs.
+    methods: Counts,
 }
 
 fn env_f(name: &str) -> Option<f64> {
@@ -140,6 +160,26 @@ fn main() -> Result<(), String> {
         .iter()
         .map(|&i| dump_y(i, format!("e{i}"), &core, &far))
         .collect();
+    let mut dense = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            dense[i * n + j] =
+                match fasterhenry::mutual_inductance(&filaments[i], &filaments[j]) {
+                    Ok(value) => value,
+                    Err(_) => f64::NAN,
+                };
+        }
+    }
+    let methods = match fasterhenry::partial_inductance_method_counts(&filaments) {
+        Ok(c) => Counts {
+            orthogonal: c.orthogonal,
+            bar_closed_form: c.bar_closed_form,
+            aligned_quadrature: c.aligned_quadrature,
+            point_quadrature: c.point_quadrature,
+            sampled_filaments: c.sampled_filaments,
+        },
+        Err(_) => Counts::default(),
+    };
     let dump = Dump {
         n,
         filaments_head: filaments.iter().take(heads).map(fil_json).collect(),
@@ -151,6 +191,8 @@ fn main() -> Result<(), String> {
             .map(fil_json)
             .collect(),
         vectors,
+        dense,
+        methods,
     };
     let file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
     serde_json::to_writer(&file, &dump).map_err(|e| e.to_string())?;
