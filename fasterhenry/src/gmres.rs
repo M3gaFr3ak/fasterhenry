@@ -203,6 +203,13 @@ where
         }
         residual = residual_of(&mut apply, b, x);
         r_norm = norm(&residual);
+        // True residual at the cycle boundary (the restart point), printed
+        // next to the estimate `g[steps]` the inner loop last reported - the
+        // estimate-vs-true drift is what decides whether this restarts.
+        eprintln!(
+            "gmres: cycle end at iter {iterations}: true |r| = {r_norm:.4e}, est |r| = {:.4e}",
+            g[steps].modulus(),
+        );
     }
 }
 

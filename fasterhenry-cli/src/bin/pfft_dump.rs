@@ -163,11 +163,10 @@ fn main() -> Result<(), String> {
     let mut dense = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..n {
-            dense[i * n + j] =
-                match fasterhenry::mutual_inductance(&filaments[i], &filaments[j]) {
-                    Ok(value) => value,
-                    Err(_) => f64::NAN,
-                };
+            dense[i * n + j] = match fasterhenry::mutual_inductance(&filaments[i], &filaments[j]) {
+                Ok(value) => value,
+                Err(_) => f64::NAN,
+            };
         }
     }
     let methods = match fasterhenry::partial_inductance_method_counts(&filaments) {

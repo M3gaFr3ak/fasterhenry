@@ -48,6 +48,17 @@ static FALLBACK_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// (re, im) constructor over the two instantiations the schur solve uses:/// `f64` (only ever combined with ω = 0, so the imaginary part is kept but
 /// unused) and `Complex<f64>` (ω > 0). `nalgebra`'s `ComplexField` has no
 /// generic complex-from-parts constructor, so the list is explicit.
+/// Storage precision of the cubel-global precond pattern and its LU factor
+/// (`precond-f32` feature: single; default: double). The GMRES scalar is
+/// untouched - only the precond is narrowed.
+#[cfg(feature = "precond-f32")]
+pub(crate) type Prec = f32;
+#[cfg(not(feature = "precond-f32"))]
+pub(crate) type Prec = f64;
+
+/// The precond factor's complex scalar.
+pub(crate) type PrecC = Complex<Prec>;
+
 pub(crate) trait FieldParts: Copy {
     fn of(re: f64, im: f64) -> Self;
 
@@ -74,6 +85,16 @@ impl FieldParts for Complex<f64> {
 
     fn into_parts(self) -> (f64, f64) {
         (self.re, self.im)
+    }
+}
+
+impl FieldParts for Complex<f32> {
+    fn of(re: f64, im: f64) -> Complex<f32> {
+        Complex::new(re as f32, im as f32)
+    }
+
+    fn into_parts(self) -> (f64, f64) {
+        (self.re as f64, self.im as f64)
     }
 }
 
@@ -484,8 +505,8 @@ pub(crate) struct CubelGlobal {
     /// duplicates) and the two omega-halves of the values.
     col_ptr: Vec<u32>,
     row_idx: Vec<u32>,
-    re_part: Vec<f64>,
-    im_part: Vec<f64>,
+    re_part: Vec<Prec>,
+    im_part: Vec<Prec>,
     /// Symbolic LU (COLAMD order included), built once. `None` after a
     /// failed build: the apply then hands back the identity, one-shot
     /// warned.
@@ -529,7 +550,10 @@ pub(crate) fn near_pair_data(
     // Kernel evaluations dominate this stage at 80k+ branches; the pair
     // list per branch is independent, so rayon over branch indices
     // preserves the exact kernel set (each pair computed once, upper
-    // side only).
+    // side only). Report every ~5% so the sweep is not a silent hang
+    // (mirrors the pFFT precorrect progress line).
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let step = (branches / 20).max(1);
     let partner_results: Vec<Result<Vec<(u32, f64)>, KernelError>> = (0..branches)
         .into_par_iter()
         .map(|a| {
@@ -547,6 +571,13 @@ pub(crate) fn near_pair_data(
                 list.push((j as u32, m));
             }
             list.sort_by_key(|&(p, _)| p);
+            let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if d % step == 0 || d == branches {
+                let rss = crate::memgate::rss_bytes()
+                    .map(|b| format!("{:.1} GB", b as f64 / 1e9))
+                    .unwrap_or_else(|| "unreadable".to_string());
+                eprintln!("cubel-global: near-pair kernels {d}/{branches} (rss {rss})");
+            }
             Ok(list)
         })
         .collect();
@@ -653,8 +684,8 @@ impl CubelGlobal {
         struct ChunkOut {
             col_ptr: Vec<u32>,
             row_idx: Vec<u32>,
-            re_part: Vec<f64>,
-            im_part: Vec<f64>,
+            re_part: Vec<Prec>,
+            im_part: Vec<Prec>,
             peak_col: usize,
         }
         let threads = rayon::current_num_threads().max(1);
@@ -719,8 +750,8 @@ impl CubelGlobal {
                     visited.sort_unstable();
                     for &i in &visited {
                         out.row_idx.push(i);
-                        out.re_part.push(acc_re[i as usize]);
-                        out.im_part.push(acc_im[i as usize]);
+                        out.re_part.push(acc_re[i as usize] as Prec);
+                        out.im_part.push(acc_im[i as usize] as Prec);
                     }
                     col_ptr[col - lo + 1] = out.row_idx.len() as u32;
                     out.peak_col = out.peak_col.max(visited.len());
@@ -749,8 +780,8 @@ impl CubelGlobal {
         let mut col_ptr: Vec<u32> = Vec::with_capacity(internal + 1);
         col_ptr.push(0);
         let mut row_idx: Vec<u32> = Vec::new();
-        let mut re_part: Vec<f64> = Vec::new();
-        let mut im_part: Vec<f64> = Vec::new();
+        let mut re_part: Vec<Prec> = Vec::new();
+        let mut im_part: Vec<Prec> = Vec::new();
         let mut peak_col = 0usize;
         for chunk in chunks {
             let base = row_idx.len() as u32;
@@ -806,19 +837,16 @@ impl CubelGlobal {
     /// build, so the fill update is a numeric-only pass). Failure falls
     /// back to `None`, and the apply then hands back the identity - the
     /// same floor the `none` knob gives - with a one-shot warning.
-    pub(crate) fn factor<T>(&self, omega: f64) -> Option<Lu<u32, T>>
-    where
-        T: FieldParts + FaerComplexField + Copy,
-    {
+    pub(crate) fn factor(&self, omega: f64) -> Option<Lu<u32, PrecC>> {
         let wall = std::time::Instant::now();
         // Note: the column-major slice below wants values ordered by
         // (col, row) ascending; the CSC arrays already are, so the values
         // vector is CSC values verbatim.
-        let values: Vec<T> = self
+        let values: Vec<PrecC> = self
             .re_part
             .iter()
             .zip(&self.im_part)
-            .map(|(&re, &im)| T::of(re, omega * im))
+            .map(|(&re, &im)| PrecC::of(re as f64, omega * im as f64))
             .collect();
         let sym = faer::sparse::SymbolicSparseColMat::new_checked(
             self.n,
@@ -830,7 +858,7 @@ impl CubelGlobal {
         let Some(symbolic) = &self.symbolic else {
             return None;
         };
-        let mat = faer::sparse::SparseColMatRef::<u32, T>::new(sym.as_ref(), &values);
+        let mat = faer::sparse::SparseColMatRef::<u32, PrecC>::new(sym.as_ref(), &values);
         match Lu::try_new_with_symbolic(symbolic.clone(), mat) {
             Ok(factors) => {
                 eprintln!(
@@ -854,18 +882,32 @@ impl CubelGlobal {
     }
 
     /// Per-solve apply: the LU's triangular on `v`; identity if the
-    /// factor failed.
-    pub(crate) fn apply_global<T>(factors: Option<&Lu<u32, T>>, n: usize, v: &[T]) -> Vec<T>
+    /// factor failed. `v` is the GMRES scalar; it is cast into the precond
+    /// scalar (`PrecC`), solved, and cast back - one O(n) conversion per
+    /// apply, negligible next to the triangular solve.
+    pub(crate) fn apply_global<T>(factors: Option<&Lu<u32, PrecC>>, n: usize, v: &[T]) -> Vec<T>
     where
-        T: FaerComplexField + Copy,
+        T: FaerComplexField + FieldParts + Copy,
     {
         match factors {
             Some(factors) => {
-                let mut out = v.to_vec();
-                let rhs =
-                    faer::MatMut::<T, usize, usize>::from_column_major_slice_mut(&mut out, n, 1);
+                let mut out: Vec<PrecC> = v
+                    .iter()
+                    .map(|&x| {
+                        let (re, im) = x.into_parts();
+                        PrecC::of(re, im)
+                    })
+                    .collect();
+                let rhs = faer::MatMut::<PrecC, usize, usize>::from_column_major_slice_mut(
+                    &mut out, n, 1,
+                );
                 factors.solve_in_place_with_conj(faer::Conj::No, rhs);
-                out
+                out.iter()
+                    .map(|&x| {
+                        let (re, im) = x.into_parts();
+                        T::of(re, im)
+                    })
+                    .collect()
             }
             None => v.to_vec(),
         }

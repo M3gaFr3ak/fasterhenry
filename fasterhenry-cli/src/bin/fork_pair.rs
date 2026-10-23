@@ -16,8 +16,7 @@ fn main() -> Result<(), String> {
     let nodes: Vec<geometry::Node> = problem.geometry.nodes().to_vec();
     let mut segments: Vec<geometry::SegmentDef> = problem.geometry.segment_defs().to_vec();
     segments.truncate(take);
-    let geometry =
-        geometry::Geometry::from_parts(nodes, segments).expect("geometry");
+    let geometry = geometry::Geometry::from_parts(nodes, segments).expect("geometry");
     let ports = vec![Port::new(NodeId(0), NodeId(1)).named("probe")];
     let system = fasterhenry::IterativeSystem::assemble(
         &geometry,
@@ -38,7 +37,10 @@ fn main() -> Result<(), String> {
     }
     for spec in env::args().skip(2) {
         let (i, j) = spec.split_once(':').expect("i:j pair spec");
-        let (i, j) = (i.parse::<usize>().expect("i"), j.parse::<usize>().expect("j"));
+        let (i, j) = (
+            i.parse::<usize>().expect("i"),
+            j.parse::<usize>().expect("j"),
+        );
         let (a, b) = (&filaments[i - 1], &filaments[j - 1]);
         match fasterhenry::inductance::mutual_inductance_detailed(a, b) {
             Ok(m) => println!(

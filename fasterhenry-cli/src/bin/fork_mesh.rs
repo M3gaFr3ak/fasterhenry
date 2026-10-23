@@ -14,10 +14,7 @@ fn row_text(mesh: &MeshMatrix, i: usize) -> String {
 
 fn main() -> Result<(), String> {
     let deck = env::args().nth(1).expect("usage: fork_mesh <deck> [rows]");
-    let rows_to_print: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+    let rows_to_print: usize = env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(5);
     let problem = fasterhenry_cli::read_inputs(std::path::Path::new(&deck))
         .map_err(|e| format!("read {deck}: {e}"))?;
     let geometry = &problem.geometry;
@@ -25,8 +22,8 @@ fn main() -> Result<(), String> {
     // 1:1 decks only (.default nwinc = nhinc = 1 -> one filament per
     // segment); a cross-section-refined deck would need the real counts.
     let per_segment = vec![1usize; geometry.segment_defs().len()];
-    let mesh = MeshMatrix::build(geometry, &per_segment, ports)
-        .map_err(|e| format!("mesh: {e}"))?;
+    let mesh =
+        MeshMatrix::build(geometry, &per_segment, ports).map_err(|e| format!("mesh: {e}"))?;
     println!("segments          = {}", geometry.segment_defs().len());
     println!("nodes             = {}", geometry.nodes().len());
     // first few segments: their endpoint node ids + positions (to compare

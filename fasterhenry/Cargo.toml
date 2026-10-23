@@ -20,6 +20,12 @@ include = ["src/**/*.rs", "README.md", "LICENSE", "CHANGELOG.md"]
 # Criterion owns `cargo bench`; the default libtest harness rejects its flags.
 bench = false
 
+[features]
+# Store the cubel-global preconditioner's pattern (CSC) and its LU factor in
+# single precision instead of double. Memory lever for the fill-bound cases;
+# accuracy (iteration count) is empirical. Build with `--features precond-f32`.
+precond-f32 = []
+
 [dependencies]
 nalgebra = { workspace = true }
 faer = { workspace = true }

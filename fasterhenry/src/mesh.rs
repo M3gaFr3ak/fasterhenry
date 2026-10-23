@@ -144,6 +144,20 @@ pub enum MeshError {
         /// Index of the offending segment.
         segment: usize,
     },
+    /// The per-segment filament counts differ, which the coarse/fine
+    /// subdivision precond (`cubel-global-sub`) does not support.
+    #[error(
+        "segment {segment} has {got} filaments but segment 0 has {expected}: \
+         non-uniform per-segment subdivision is not supported by cubel-global-sub"
+    )]
+    NonUniformSubdivision {
+        /// Index of the first segment whose count differs from segment 0's.
+        segment: usize,
+        /// Its filament count.
+        got: usize,
+        /// Segment 0's filament count.
+        expected: usize,
+    },
 }
 
 /// A single (a, b) branch in the matrix-injection path

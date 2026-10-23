@@ -81,12 +81,12 @@ use crate::filament::Filament;
 use crate::geometry::Geometry;
 use crate::gmres::{gmres, GmresOutcome, GmresParams};
 use crate::inductance::{mutual_inductance, self_inductance, KernelError};
-use crate::mesh::{MeshMatrix, Port};
+use crate::mesh::{MeshError, MeshMatrix, Port};
 use crate::pfft::{PfftOperator, PfftParams, PfftStats};
 use crate::result::{Counts, Provenance, SweepResult, Timing};
 use crate::solve::{
     check_frequency, discretize_geometry, filament_resistance, Discretization, SolveError,
-    SWEEP_MEMORY_BUDGET_BYTES,
+    Subdivision, SWEEP_MEMORY_BUDGET_BYTES,
 };
 use crate::twolevel::{TwoLevel, TwoLevelFactors};
 
@@ -121,6 +121,17 @@ pub struct IterativeSolution {
 }
 
 /// The assembled, frequency-independent, matrix-free mesh system of a
+/// The coarse (un-subdivided) twin of a subdivided system: one filament per
+/// segment. Built at `assemble` when the fine mesh is subdivided; the
+/// coarse/fine precond (`cubel-global-sub`) factors this instead of the fine
+/// system, so its footprint is the un-subdivided size.
+#[derive(Debug)]
+pub(crate) struct CoarseSystem {
+    pub(crate) filaments: Vec<Filament>,
+    pub(crate) resistances: Vec<f64>,
+    pub(crate) mesh: MeshMatrix,
+}
+
 /// geometry and its ports. See the [module documentation](self).
 #[derive(Debug)]
 pub struct IterativeSystem {
@@ -128,6 +139,12 @@ pub struct IterativeSystem {
     filaments: Vec<Filament>,
     resistances: Vec<f64>,
     mesh: MeshMatrix,
+    /// Filaments per segment (the discretization's per-segment counts). The
+    /// coarse/fine precond aggregates fine branches into segments with it.
+    per_segment: Vec<usize>,
+    /// The coarse (one-filament-per-segment) twin, when the fine mesh is
+    /// subdivided. `None` when the fine mesh is already un-subdivided.
+    coarse: Option<CoarseSystem>,
     operator: PfftOperator,
     /// The conv-matvec near half ([`MatvecCore`], increment 5): built
     /// when `FASTERHENRY_CONV_MATVEC=1`, alongside a far-only pFFT
@@ -169,6 +186,30 @@ impl IterativeSystem {
         let (filaments, per_segment) = discretize_geometry(geometry, discretization)?;
         let mesh = MeshMatrix::build(geometry, &per_segment, ports)?;
         let resistances: Vec<f64> = filaments.iter().map(filament_resistance).collect();
+
+        // The coarse (one-filament-per-segment) twin, for the coarse/fine
+        // precond. Only built when the fine mesh is actually subdivided; else
+        // the coarse == the fine and today's cubel-global already is it.
+        let coarse = if per_segment.iter().all(|&n| n == 1) {
+            None
+        } else {
+            let unit = Discretization::Uniform(Subdivision::new(1, 1));
+            let (cf, cps) = discretize_geometry(geometry, &unit)?;
+            let cmesh = MeshMatrix::build(geometry, &cps, ports)?;
+            let cres: Vec<f64> = cf.iter().map(filament_resistance).collect();
+            eprintln!(
+                "cubel-global-sub: coarse twin: {} segments, {} loops (fine: {} branches, {} loops)",
+                cmesh.branch_count(),
+                cmesh.internal_count(),
+                mesh.branch_count(),
+                mesh.internal_count(),
+            );
+            Some(CoarseSystem {
+                filaments: cf,
+                resistances: cres,
+                mesh: cmesh,
+            })
+        };
 
         let operator_start = Instant::now();
         // The conv-matvec lane (increment 5): `FASTERHENRY_CONV_MATVEC=1`
@@ -318,6 +359,8 @@ impl IterativeSystem {
             filaments,
             resistances,
             mesh,
+            per_segment,
+            coarse,
             operator,
             matvec,
             gmres: params.gmres,
@@ -331,6 +374,26 @@ impl IterativeSystem {
             operator_seconds,
             assembly_seconds: start.elapsed().as_secs_f64(),
         })
+    }
+
+    /// The number of intra-segment (redistribution) loops, `sum(n_i - 1)`:
+    /// rows `0..intra_loop_count()` of the loop basis, with the trailing rows
+    /// the coarse/forest loops. The coarse/fine precond splits on this.
+    pub(crate) fn intra_loop_count(&self) -> usize {
+        self.per_segment.iter().map(|&n| n - 1).sum()
+    }
+
+    /// The first segment whose filament count differs from segment 0's, or
+    /// `None` if all agree. The coarse/fine precond's aggregation assumes
+    /// uniformity; a non-uniform deck is a user error there.
+    pub(crate) fn non_uniform_segment(&self) -> Option<usize> {
+        let first = *self.per_segment.first()?;
+        self.per_segment.iter().position(|&n| n != first)
+    }
+
+    /// Filaments per segment (the discretization's per-segment counts).
+    pub(crate) fn per_segment(&self) -> &[usize] {
+        &self.per_segment
     }
 
     /// The ports, in the order of the rows and columns of `Z`.
@@ -390,6 +453,7 @@ impl IterativeSystem {
             let precond = match kind {
                 PrecondKind::Cubel => Precond::cubel(self, 0.0)?,
                 PrecondKind::CubelGlobal => Precond::cubel_global(self, 0.0)?,
+                PrecondKind::CubelGlobalSub => Precond::cubel_global_sub(self, 0.0)?,
                 PrecondKind::TwoLevel => Precond::two_level(self, 0.0)?,
                 PrecondKind::Conv => Precond::conv_kind(self, 0.0)?,
                 PrecondKind::None => Precond::Identity,
@@ -418,6 +482,7 @@ impl IterativeSystem {
             let precond = match kind {
                 PrecondKind::Cubel => Precond::cubel(self, omega)?,
                 PrecondKind::CubelGlobal => Precond::cubel_global(self, omega)?,
+                PrecondKind::CubelGlobalSub => Precond::cubel_global_sub(self, omega)?,
                 PrecondKind::TwoLevel => Precond::two_level(self, omega)?,
                 PrecondKind::Conv => Precond::conv_kind(self, omega)?,
                 PrecondKind::None => Precond::Identity,
@@ -601,6 +666,10 @@ enum PrecondKind {
     /// The D-4 letter: one global near-pattern matrix factored by faer's
     /// sparse LU (`FASTERHENRY_PRECOND=cubel-global`).
     CubelGlobal,
+    /// The coarse/fine subdivision precond: the same global factorization,
+    /// but on the one-filament-per-segment twin, so its footprint is the
+    /// un-subdivided size (`FASTERHENRY_PRECOND=cubel-global-sub`).
+    CubelGlobalSub,
     /// The D-17 first rung: one global near-pattern matrix split by
     /// copper layer into per-layer blocks plus a cross-layer CSR
     /// applied in a two-sweep block Gauss-Seidel
@@ -626,6 +695,7 @@ impl PrecondKind {
             Ok("none") => PrecondKind::None,
             Ok("cubel") => PrecondKind::Cubel,
             Ok("cubel-global") => PrecondKind::CubelGlobal,
+            Ok("cubel-global-sub") => PrecondKind::CubelGlobalSub,
             Ok("two-level") => PrecondKind::TwoLevel,
             Ok("conv") => PrecondKind::Conv,
             _ => PrecondKind::Jacobi,
@@ -641,7 +711,9 @@ enum Precond<T: ComplexField<RealField = f64> + Copy> {
     /// i.e. the unpreconditioned iteration floor.
     Identity,
     Cubel(Box<CubelState<T>>),
-    CubelGlobal(Box<CubelGlobalState<T>>),
+    CubelGlobal(Box<CubelGlobalState>),
+    /// The coarse/fine (subdivision) precond: factored on the coarse twin.
+    CubelGlobalSub(Box<CubelSubState>),
     TwoLevel(Box<TwoLevelState<T>>),
     Conv(Box<ConvCore>),
 }
@@ -657,9 +729,22 @@ struct CubelState<T: ComplexField<RealField = f64> + Copy> {
 /// its COLAMD symbolic factorization, plus this frequency's numeric LU
 /// (`None` after a failed factorization: the apply falls back to the
 /// identity, with a one-shot warning from the builder).
-struct CubelGlobalState<T: ComplexField<RealField = f64> + Copy> {
+struct CubelGlobalState {
     global: CubelGlobal,
-    factors: Option<faer::sparse::linalg::solvers::Lu<u32, T>>,
+    factors: Option<faer::sparse::linalg::solvers::Lu<u32, crate::cubel::PrecC>>,
+}
+
+/// The coarse/fine ("subdivision") state: the precond factored on the **coarse**
+/// (one-filament-per-segment) twin, plus the loop-space restriction onto its
+/// conductor loops. The fine internal rows `r_off..r_off + c_len` ARE the
+/// coarse's loops (checked at build), so `R`/`P` are a selection there and the
+/// intra-segment (bundle) rows restrict to zero.
+struct CubelSubState {
+    factors: Option<faer::sparse::linalg::solvers::Lu<u32, crate::cubel::PrecC>>,
+    /// First fine internal row that is a coarse (conductor) loop.
+    r_off: usize,
+    /// Number of coarse loops == the fine's conductor loop count.
+    c_len: usize,
 }
 
 /// The built two-level state: the omega-independent layer split plus
@@ -906,10 +991,74 @@ where
             system.operator.near_radius() * radius_mult,
         )
         .map_err(SolveError::from)?;
-        let factors = global.factor::<T>(omega);
+        let factors = global.factor(omega);
         Ok(Self::CubelGlobal(Box::new(CubelGlobalState {
             global,
             factors,
+        })))
+    }
+
+    /// Builds the coarse/fine ("subdivision") state at `omega`.
+    ///
+    /// The precond is factored on the **coarse** (one-filament-per-segment)
+    /// twin (`system.coarse`), so its footprint is the un-subdivided size -
+    /// the point on a subdivided deck. The apply restricts the fine loop
+    /// residual onto the coarse conductor loops, solves the coarse system,
+    /// and prolongates back. `R`/`P` are a selection: the fine's conductor
+    /// rows ARE the coarse's loops (reported at build), and the intra-segment
+    /// (bundle) rows restrict to zero (the deferred smoother's job). With
+    /// `nwinc=nhinc=1` there is no split, so this falls through to
+    /// `cubel-global`.
+    fn cubel_global_sub(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError> {
+        crate::memgate::set_stage(crate::memgate::STAGE_PRECOND);
+        if let Some(seg) = system.non_uniform_segment() {
+            return Err(SolveError::Mesh(MeshError::NonUniformSubdivision {
+                segment: seg,
+                got: system.per_segment()[seg],
+                expected: system.per_segment()[0],
+            }));
+        }
+        let Some(coarse) = &system.coarse else {
+            return Self::cubel_global(system, omega);
+        };
+
+        let radius_mult: f64 = std::env::var("FASTERHENRY_CUBEL_RADIUS_MULT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1.0);
+        let radius_mult = if radius_mult > 0.0 { radius_mult } else { 1.0 };
+
+        let cglobal = CubelGlobal::build(
+            &coarse.mesh,
+            &coarse.filaments,
+            &coarse.resistances,
+            system.operator.near_radius() * radius_mult,
+        )
+        .map_err(SolveError::from)?;
+        let factors = cglobal.factor(omega);
+
+        // R/P select the fine's conductor block (the trailing rows); the
+        // bundle rows are intra-segment and restrict to zero.
+        let r_off = system.intra_loop_count();
+        let c_len = coarse.mesh.internal_count();
+        assert_eq!(
+            system.mesh.internal_count() - r_off,
+            c_len,
+            "cubel-global-sub: fine conductor loops {} != coarse loops {c_len}",
+            system.mesh.internal_count() - r_off
+        );
+        sub_nesting_report(system, coarse, r_off, c_len);
+        if std::env::var("FASTERHENRY_CUBEL_SUB_CHECK")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+        {
+            sub_identity_check(system, coarse, r_off, c_len);
+        }
+
+        Ok(Self::CubelGlobalSub(Box::new(CubelSubState {
+            factors,
+            r_off,
+            c_len,
         })))
     }
 
@@ -959,9 +1108,185 @@ where
             Self::CubelGlobal(state) => {
                 CubelGlobal::apply_global(state.factors.as_ref(), state.global.n(), v)
             }
+            Self::CubelGlobalSub(state) => {
+                // z = P (A_c^-1) (R v): restrict onto the coarse loops, solve
+                // the coarse system, prolongate back. R/P are the selection of
+                // the fine's conductor block (the bundle rows map to zero).
+                let mut z = vec![T::zero(); v.len()];
+                let rv = &v[state.r_off..state.r_off + state.c_len];
+                let solved = CubelGlobal::apply_global(state.factors.as_ref(), state.c_len, rv);
+                z[state.r_off..state.r_off + state.c_len].copy_from_slice(&solved);
+                z
+            }
             Self::TwoLevel(state) => state.pattern.apply(&state.factors, v),
             Self::Conv(core) => conv_apply::<T>(core, v),
         }
+    }
+}
+
+/// Index-only debug report: are the fine's conductor rows (each branch mapped
+/// to its segment) the same loops as the coarse's rows? Prints a summary and,
+/// on mismatches, dumps the first ones to `cubel_sub_nesting.txt`. This is the
+/// "test current"-free structural check of the `R`/`P` premise (the loop sets
+/// are nested); it is a build-time diagnostic, not an ongoing harness.
+fn sub_nesting_report(system: &IterativeSystem, coarse: &CoarseSystem, r_off: usize, c_len: usize) {
+    let per_segment = system.per_segment();
+    let mut seg_of = vec![usize::MAX; system.mesh.branch_count()];
+    let mut b = 0usize;
+    for (s, &n) in per_segment.iter().enumerate() {
+        for _ in 0..n {
+            seg_of[b] = s;
+            b += 1;
+        }
+    }
+    let norm = |row: &[(usize, f64)]| -> Vec<(usize, i64)> {
+        let mut v: Vec<(usize, i64)> = row.iter().map(|&(i, s)| (i, s as i64)).collect();
+        v.sort_unstable();
+        v
+    };
+    let mut mism = 0usize;
+    let mut dump = String::new();
+    for j in 0..c_len {
+        let fine: Vec<(usize, f64)> = system
+            .mesh
+            .row(r_off + j)
+            .iter()
+            .map(|&(br, sg)| (seg_of[br], sg))
+            .collect();
+        let a = norm(&fine);
+        let c = norm(coarse.mesh.row(j));
+        if a != c {
+            mism += 1;
+            if mism <= 20 {
+                dump.push_str(&format!("coarse loop {j}: fine {a:?} | coarse {c:?}\n"));
+            }
+        }
+    }
+    eprintln!(
+        "cubel-global-sub: nesting: {c_len} coarse loops, {mism} mismatched vs the fine conductor rows"
+    );
+    if mism > 0 {
+        let path = "cubel_sub_nesting.txt";
+        if std::fs::write(path, &dump).is_ok() {
+            eprintln!("cubel-global-sub: wrote {path} (first mismatches)");
+        }
+    }
+}
+
+/// The fine branch -> segment map (the structure of the aggregation `S`) from
+/// the per-segment counts: branch `b` belongs to segment `s` iff `b` falls in
+/// `s`'s consecutive range (the mesh's `first_branch` ordering).
+fn fine_branch_segment(per_segment: &[usize]) -> Vec<usize> {
+    let mut seg_of = Vec::with_capacity(per_segment.iter().sum());
+    for (s, &n) in per_segment.iter().enumerate() {
+        for _ in 0..n {
+            seg_of.push(s);
+        }
+    }
+    seg_of
+}
+
+/// The worst residual of the value-side identity used by `cubel-global-sub`:
+/// the loop-space restriction `R` (the conductor-block selection) and the
+/// branch aggregation `S` must agree, i.e. `M_c^T (R x) == S (M_f^T x)` for
+/// every fine loop current `x`. Both sides are linear, so the unit vectors
+/// (the incidence rows) are exhaustive; a general deterministic current is
+/// checked as a cross-check.
+fn sub_identity_worst(
+    system: &IterativeSystem,
+    coarse: &CoarseSystem,
+    r_off: usize,
+    c_len: usize,
+) -> f64 {
+    let seg_of = fine_branch_segment(system.per_segment());
+    let bc = coarse.mesh.branch_count();
+    let fl = system.mesh.internal_count();
+
+    // i_c = S (M_f^T x): the fine branch currents aggregated per segment.
+    let s_apply = |xf: &[f64]| -> Vec<f64> {
+        let mut ic = vec![0.0; bc];
+        for (e, &x) in xf.iter().enumerate() {
+            if x == 0.0 {
+                continue;
+            }
+            for &(b, sgn) in system.mesh.row(e) {
+                ic[seg_of[b]] += x * sgn;
+            }
+        }
+        ic
+    };
+    // x_c = R x: the fine's conductor block (e >= r_off) -> the coarse.
+    let r_apply = |xf: &[f64]| -> Vec<f64> {
+        let mut xc = vec![0.0; c_len];
+        for e in r_off..r_off + c_len {
+            xc[e - r_off] = xf[e];
+        }
+        xc
+    };
+    // i_c = M_c^T x_c.
+    let mc_t_apply = |xc: &[f64]| -> Vec<f64> {
+        let mut ic = vec![0.0; bc];
+        for (j, &x) in xc.iter().enumerate() {
+            if x == 0.0 {
+                continue;
+            }
+            for &(b, sgn) in coarse.mesh.row(j) {
+                ic[b] += x * sgn;
+            }
+        }
+        ic
+    };
+    let worst_of = |xf: &[f64]| -> f64 {
+        s_apply(xf)
+            .iter()
+            .zip(&mc_t_apply(&r_apply(xf)))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+    };
+
+    let mut worst = 0.0f64;
+    for e in 0..fl {
+        let mut xf = vec![0.0; fl];
+        xf[e] = 1.0;
+        worst = worst.max(worst_of(&xf));
+    }
+    let xf: Vec<f64> = (0..fl)
+        .map(|i| ((i.wrapping_mul(2654435761)) % 1000) as f64 / 1000.0 - 0.5)
+        .collect();
+    worst.max(worst_of(&xf))
+}
+
+/// Value-side debug wrapper: runs [`sub_identity_worst`], prints it, and dumps
+/// `S`/`R` and the result to `cubel_sub_check.txt`. Gated on
+/// `FASTERHENRY_CUBEL_SUB_CHECK=1`.
+fn sub_identity_check(system: &IterativeSystem, coarse: &CoarseSystem, r_off: usize, c_len: usize) {
+    let seg_of = fine_branch_segment(system.per_segment());
+    let bf = system.mesh.branch_count();
+    let bc = coarse.mesh.branch_count();
+    let fl = system.mesh.internal_count();
+    let worst = sub_identity_worst(system, coarse, r_off, c_len);
+
+    eprintln!(
+        "cubel-global-sub: identity  M_c^T R x == S M_f^T x : worst |diff| = {worst:e}  (unit + general)"
+    );
+
+    let mut out = String::new();
+    out.push_str("# cubel-global-sub debug dump\n");
+    out.push_str(&format!(
+        "# fine: {fl} internal loops, {bf} branches; coarse: {c_len} loops, {bc} branches\n"
+    ));
+    out.push_str(&format!("# r_off (first conductor loop) = {r_off}\n"));
+    out.push_str("# S: fine branch -> segment (the aggregation structure)\n");
+    for b in 0..bf {
+        out.push_str(&format!("S fine branch {b} -> segment {}\n", seg_of[b]));
+    }
+    out.push_str("# R/P: fine conductor loop -> coarse loop (identity offset)\n");
+    for j in 0..c_len {
+        out.push_str(&format!("R fine loop {} -> coarse loop {j}\n", r_off + j));
+    }
+    out.push_str(&format!("# identity worst |diff| = {worst:e}\n"));
+    if std::fs::write("cubel_sub_check.txt", &out).is_ok() {
+        eprintln!("cubel-global-sub: wrote cubel_sub_check.txt");
     }
 }
 
@@ -1043,4 +1368,75 @@ fn loop_inductance(filaments: &[Filament], row: &[(usize, f64)]) -> Result<f64, 
         }
     }
     Ok(own + 2.0 * mutual)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{Node, NodeId, SegmentDef};
+
+    const COPPER: f64 = 5.8e7;
+
+    /// A unit square ring, uniformly subdivided `2x2` per segment, with a
+    /// diagonal port and a stub - enough segments for several loop types.
+    fn subdivided_loop() -> IterativeSystem {
+        let mut geometry = Geometry::new();
+        for point in [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ] {
+            geometry.add_node(Node::from(point)).unwrap();
+        }
+        for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0), (3, 4)] {
+            geometry
+                .add_segment(SegmentDef::new(NodeId(a), NodeId(b), 1e-3, 1e-3, COPPER))
+                .unwrap();
+        }
+        let ports = [Port::new(NodeId(1), NodeId(4))];
+        IterativeSystem::assemble(
+            &geometry,
+            &ports,
+            &Discretization::uniform(2, 2),
+            &IterativeParams::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sub_identity_holds() {
+        let system = subdivided_loop();
+        let coarse = system
+            .coarse
+            .as_ref()
+            .expect("subdivided: the coarse twin must exist");
+        let r_off = system.intra_loop_count();
+        let c_len = coarse.mesh.internal_count();
+        assert_eq!(
+            system.mesh.internal_count() - r_off,
+            c_len,
+            "fine conductor loops ({}) != coarse loops ({c_len})",
+            system.mesh.internal_count() - r_off
+        );
+        let worst = sub_identity_worst(&system, coarse, r_off, c_len);
+        assert!(
+            worst < 1e-12,
+            "M_c^T R x != S M_f^T x: worst |diff| = {worst:e}"
+        );
+    }
+
+    #[test]
+    fn cubel_global_sub_builds_on_subdivided() {
+        let system = subdivided_loop();
+        let precond: Precond<C64> = Precond::cubel_global_sub(&system, 1.0e7).unwrap();
+        match precond {
+            Precond::CubelGlobalSub(state) => {
+                assert!(state.c_len > 0 && state.r_off > 0);
+                assert!(state.factors.is_some());
+            }
+            _ => panic!("expected CubelGlobalSub"),
+        }
+    }
 }
