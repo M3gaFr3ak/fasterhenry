@@ -734,14 +734,16 @@ struct CubelGlobalState {
     factors: Option<faer::sparse::linalg::solvers::Lu<u32, crate::cubel::PrecC>>,
 }
 
-/// The coarse/fine ("subdivision") state: a **multiplicative two-level**
-/// preconditioner, `z = B_b^-1 v + P A_c^-1 R (v - Z B_b^-1 v)`. `B_b` is a
-/// full-rank local (block-local) smoother over the fine mesh that covers every
-/// DOF - including the intra-segment (bundle) rows a coarse operator cannot
-/// represent - while the coarse factor `A_c` (built on the one-filament-per-
-/// segment twin) corrects the conductor part of the residual the local
-/// smoother leaves behind. `R`/`P` select the fine conductor block
-/// `r_off..r_off + c_len` (the coarse's loops, checked at build).
+/// The coarse/fine ("subdivision") state: a **block-lower-triangular** two-level
+/// preconditioner. Row layout: bundle loops are `0..r_off`, conductor loops are
+/// `r_off..r_off + c_len`.
+/// ```text
+///   z_C = A_c^-1 v_C                  (conductor block, the coarse-twin factor)
+///   z_B = B_b^-1 (v_B - [Z z_C]_B)    (bundle block, conductor field removed)
+/// ```
+/// `B_b` is the block-local fine smoother (full rank: covers every DOF); the
+/// coarse step feeds the bundle rows the conductor solution's field, capturing
+/// the `Z_BC` coupling the block-diagonal and multiplicative forms dropped.
 struct CubelSubState<T: ComplexField<RealField = f64> + Copy> {
     /// The local (`B_b^-1`) smoother: block-local over the fine mesh.
     local: CubelState<T>,
@@ -1136,21 +1138,28 @@ where
                 CubelGlobal::apply_global(state.factors.as_ref(), state.global.n(), v)
             }
             Self::CubelGlobalSub(state) => {
-                // Multiplicative two-level:
-                //   z = B_b^-1 v + P A_c^-1 R (v - Z B_b^-1 v)
-                // B_b is the block-local fine smoother (full rank); the coarse
-                // step corrects the conductor part of the residual it leaves.
-                let zb = state.local.pattern.apply_blocks(&state.local.factors, v);
-                let w = op(&zb);
-                let mut rc = vec![T::zero(); state.c_len];
-                for j in 0..state.c_len {
-                    rc[j] = v[state.r_off + j] - w[state.r_off + j];
+                // Block-lower-triangular two-level. Row layout: bundle loops
+                // are 0..r_off, conductor loops are r_off..r_off+c_len.
+                //   z_C = A_c^-1 v_C                    (conductor block)
+                //   z_B = B_b^-1 (v_B - [Z z_C]_B)      (bundle block, with
+                //                                        the conductor field removed)
+                // Captures the Z_BC coupling the block-diagonal and
+                // multiplicative forms dropped; `z_C` is global, so the bundle
+                // rows see the coarse solution, not just their local residual.
+                let nb = state.r_off;
+                let c_end = nb + state.c_len;
+                let mut z = vec![T::zero(); v.len()];
+                let z_c =
+                    CubelGlobal::apply_global(state.factors.as_ref(), state.c_len, &v[nb..c_end]);
+                z[nb..c_end].copy_from_slice(&z_c);
+                // The conductor solution's field on the bundle rows.
+                let field = op(&z);
+                let mut rhs = vec![T::zero(); v.len()];
+                for i in 0..nb {
+                    rhs[i] = v[i] - field[i];
                 }
-                let sc = CubelGlobal::apply_global(state.factors.as_ref(), state.c_len, &rc);
-                let mut z = zb;
-                for j in 0..state.c_len {
-                    z[state.r_off + j] += sc[j];
-                }
+                let zb = state.local.pattern.apply_blocks(&state.local.factors, &rhs);
+                z[..nb].copy_from_slice(&zb[..nb]);
                 z
             }
             Self::TwoLevel(state) => state.pattern.apply(&state.factors, v),
