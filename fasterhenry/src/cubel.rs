@@ -154,40 +154,45 @@ impl CubelPattern {
         // resistance). Same pair enumeration as `precorrect`, minus the
         // grid part.
         let pairs = near_pairs(filaments, params.near_radius, "cubel");
-        let mut partners: Vec<Vec<(u32, f64)>> = vec![Vec::new(); branches];
+        // One mutual per near pair (order 1e8 on the subdivided decks). The
+        // branches are independent, so rayon over them exactly as
+        // `near_pair_data` does (upper-side filter keeps each pair computed
+        // once; the sort rides along). Report every ~5% so the sweep is never
+        // a silent multi-minute span.
         let self_l: Vec<f64> = filaments.iter().map(self_inductance).collect();
-        // One mutual per near pair (order 1e8 on the subdivided decks), serially:
-        // meter it so the phase is never a silent multi-minute span.
-        let report_step = (branches / 20).max(1);
-        for a in 0..branches {
-            let direction = filaments[a].direction();
-            for &j in &pairs[a] {
-                let j = j as usize;
-                if j <= a {
-                    continue;
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let step = (branches / 20).max(1);
+        let partner_results: Vec<Result<Vec<(u32, f64)>, KernelError>> = (0..branches)
+            .into_par_iter()
+            .map(|a| {
+                let direction = filaments[a].direction();
+                let mut list: Vec<(u32, f64)> = Vec::new();
+                for &j in &pairs[a] {
+                    let j = j as usize;
+                    if j <= a {
+                        continue;
+                    }
+                    if direction.dot(&filaments[j].direction()).abs() < ORTHOGONAL_COS {
+                        continue;
+                    }
+                    let m = mutual_inductance(&filaments[a], &filaments[j])?;
+                    list.push((j as u32, m));
                 }
-                if direction.dot(&filaments[j].direction()).abs() < ORTHOGONAL_COS {
-                    continue;
+                list.sort_by_key(|&(p, _)| p);
+                let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if d % step == 0 || d == branches {
+                    let rss = crate::memgate::rss_bytes()
+                        .map(|b| format!("{:.1} GB", b as f64 / 1e9))
+                        .unwrap_or_else(|| "unreadable".to_string());
+                    eprintln!("cubel: partners {d}/{branches} (rss {rss})");
                 }
-                let m = mutual_inductance(&filaments[a], &filaments[j])?;
-                partners[a].push((j as u32, m));
-            }
-            if (a + 1) % report_step == 0 {
-                eprintln!("cubel: partners {}/{}", a + 1, branches);
-            }
+                Ok(list)
+            })
+            .collect();
+        let mut partners: Vec<Vec<(u32, f64)>> = Vec::with_capacity(branches);
+        for result in partner_results {
+            partners.push(result?);
         }
-        let sort_wall = std::time::Instant::now();
-        let sort_step = (branches / 20).max(1);
-        for (i, list) in partners.iter_mut().enumerate() {
-            list.sort_by_key(|&(p, _)| p);
-            if (i + 1) % sort_step == 0 {
-                eprintln!("cubel: sorting partners {}/{}", i + 1, branches);
-            }
-        }
-        eprintln!(
-            "cubel: sorted partners in {:.3} s",
-            sort_wall.elapsed().as_secs_f64()
-        );
 
         // Branch → internal rows incidence.
         let br_wall = std::time::Instant::now();
@@ -224,46 +229,40 @@ impl CubelPattern {
             lb_wall.elapsed().as_secs_f64()
         );
 
-        // Cube partition: two passes of one sizing rule - partition,
-        // measure the worst row block, rescale once, re-partition.
+        // Bounded cube partition: recursively bisect the rows (by the median
+        // of their representative centres, along the block's widest axis)
+        // until every block holds at most `max_block_rows`. A uniform grid +
+        // one rescale cannot bound a clustered geometry - on the DC-bus deck
+        // it collapsed a whole plane cluster into one cube (7,637 rows vs the
+        // 110 target), an ~1 GB dense block.
         let part_wall = std::time::Instant::now();
         let centres: Vec<_> = filaments.iter().map(|f| f.center()).collect();
-        let rows_per_branch = (internal as f64 / branches as f64).max(1.0 / 1024.0);
-        let target_fils = (params.max_block_rows as f64 / rows_per_branch).max(1.0);
-        let mut edge = initial_edge(&centres, target_fils);
-        let mut state = partition_state(&centres, edge, &longest_branch, internal);
-        if state.worst > params.max_block_rows {
-            edge *= (state.worst as f64 / params.max_block_rows as f64).sqrt();
-            state = partition_state(&centres, edge, &longest_branch, internal);
-        }
+        let row_centre: Vec<nalgebra::Vector3<f64>> = longest_branch
+            .iter()
+            .map(|&b| centres[b as usize])
+            .collect();
+        let (row_cube, n_cubes) = partition_rows(&row_centre, params.max_block_rows);
         eprintln!(
             "cubel: cube partition in {:.3} s",
             part_wall.elapsed().as_secs_f64()
         );
-        let n_cubes = state
-            .row_cube
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, |c| c as usize + 1);
         let cr_wall = std::time::Instant::now();
         let mut cube_rows: Vec<Vec<u32>> = vec![Vec::new(); n_cubes];
         for row in 0..internal {
-            cube_rows[state.row_cube[row] as usize].push(row as u32);
+            cube_rows[row_cube[row] as usize].push(row as u32);
         }
         eprintln!(
             "cubel: cube rows in {:.3} s",
             cr_wall.elapsed().as_secs_f64()
         );
         eprintln!(
-            "cubel: {} cubes, edge {:.4e} m, worst rows/cube {}",
+            "cubel: {} cubes, worst rows/cube {}",
             n_cubes,
-            edge,
             cube_rows.iter().map(Vec::len).max().unwrap_or(0),
         );
 
         Ok(Self {
-            row_cube: state.row_cube,
+            row_cube,
             cube_rows,
             partners,
             branch_rows,
@@ -436,70 +435,62 @@ fn sign_of(row: &[(usize, f64)], b: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Metre edge of the initial cube partition: area of the two dominant
-/// bounding-box axes times the per-cube filament budget.
-fn initial_edge(centres: &[nalgebra::Vector3<f64>], target_fils: f64) -> f64 {
-    let lo = centres.iter().fold([f64::MAX; 3], |acc, c| {
-        [acc[0].min(c.x), acc[1].min(c.y), acc[2].min(c.z)]
-    });
-    let hi = centres.iter().fold([f64::MIN; 3], |acc, c| {
-        [acc[0].max(c.x), acc[1].max(c.y), acc[2].max(c.z)]
-    });
-    let mut ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
-    ext.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let area = ext[0] * ext[1];
-    if area <= 0.0 {
-        return 1.0;
-    }
-    (target_fils * area / centres.len() as f64).sqrt()
-}
-
-/// One sizing pass: branch cubes from the centres, rows via the longest
-/// member, plus the measured worst row block.
-struct PartitionState {
-    row_cube: Vec<u32>,
-    worst: usize,
-}
-
-fn partition_state(
-    centres: &[nalgebra::Vector3<f64>],
-    edge: f64,
-    longest_branch: &[u32],
-    internal: usize,
-) -> PartitionState {
-    let lo = centres.iter().fold([f64::MAX; 3], |acc, c| {
-        [acc[0].min(c.x), acc[1].min(c.y), acc[2].min(c.z)]
-    });
-    let hi = centres.iter().fold([f64::MIN; 3], |acc, c| {
-        [acc[0].max(c.x), acc[1].max(c.y), acc[2].max(c.z)]
-    });
-    let dims: [i64; 3] = [0, 1, 2].map(|k| ((hi[k] - lo[k]) / edge).ceil().max(1.0) as i64);
-    let nx = dims[0] as u32;
-    let ny = dims[1] as u32;
-    let cube_of: Vec<u32> = centres
-        .iter()
-        .map(|c| {
-            let ix = (((c.x - lo[0]) / edge).floor() as i64).clamp(0, dims[0] - 1) as u32;
-            let iy = (((c.y - lo[1]) / edge).floor() as i64).clamp(0, dims[1] - 1) as u32;
-            let iz = (((c.z - lo[2]) / edge).floor() as i64).clamp(0, dims[2] - 1) as u32;
-            ix + iy * nx + iz * nx * ny
-        })
-        .collect();
-    let mut row_cube = vec![0u32; internal];
-    let mut counts: Vec<usize> = Vec::new();
-    for (row, &branch) in longest_branch.iter().enumerate() {
-        let cube = cube_of[branch as usize];
-        row_cube[row] = cube;
-        let c = cube as usize;
-        if c >= counts.len() {
-            counts.resize(c + 1, 0);
+/// Bounded spatial partition of the internal rows: recursively bisect the
+/// rows (by the median of their representative points, along the block's
+/// widest bounding-box axis) until every block holds at most `target` rows.
+/// Returns `(row -> cube id, cube count)`.
+///
+/// A uniform grid sized to an *average* cannot bound a clustered geometry:
+/// on the DC-bus deck (a spreading bbox with dense plane islands) the grid
+/// put 7,637 rows - 70x the target - in one cube, an ~1 GB dense block, and
+/// a single rescale pass cannot fix it. Bisection bounds every block by
+/// construction, so the block factors stay the size the target implies.
+fn partition_rows(points: &[nalgebra::Vector3<f64>], target: usize) -> (Vec<u32>, usize) {
+    let n = points.len();
+    let target = target.max(1);
+    let mut row_cube = vec![0u32; n];
+    let mut next_id: u32 = 0;
+    let mut stack: Vec<Vec<u32>> = vec![(0..n as u32).collect()];
+    while let Some(mut idx) = stack.pop() {
+        if idx.len() <= target {
+            for &r in &idx {
+                row_cube[r as usize] = next_id;
+            }
+            next_id += 1;
+            continue;
         }
-        counts[c] += 1;
+        // Widest axis of the block's bounding box.
+        let mut lo = [f64::MAX; 3];
+        let mut hi = [f64::MIN; 3];
+        for &r in &idx {
+            let c = &points[r as usize];
+            lo[0] = lo[0].min(c.x);
+            lo[1] = lo[1].min(c.y);
+            lo[2] = lo[2].min(c.z);
+            hi[0] = hi[0].max(c.x);
+            hi[1] = hi[1].max(c.y);
+            hi[2] = hi[2].max(c.z);
+        }
+        let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+        let axis = if ext[0] >= ext[1] && ext[0] >= ext[2] {
+            0
+        } else if ext[1] >= ext[2] {
+            1
+        } else {
+            2
+        };
+        let coord = |r: u32| -> f64 {
+            let c = &points[r as usize];
+            [c.x, c.y, c.z][axis]
+        };
+        // Median split by coordinate, row id as the tie-break so the
+        // partition is deterministic.
+        idx.sort_unstable_by(|&a, &b| coord(a).total_cmp(&coord(b)).then(a.cmp(&b)));
+        let right = idx.split_off(idx.len() / 2);
+        stack.push(idx);
+        stack.push(right);
     }
-    PartitionState {
-        row_cube,
-        worst: counts.iter().copied().max().unwrap_or(0),
-    }
+    (row_cube, next_id as usize)
 }
 
 /// Peak RSS bookkeeping for the build/factor instrumentation: reads the
@@ -946,5 +937,51 @@ impl CubelGlobal {
             }
             None => v.to_vec(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::partition_rows;
+    use nalgebra::Vector3;
+
+    fn leaf_counts(row_cube: &[u32], n_cubes: usize) -> Vec<usize> {
+        let mut counts = vec![0usize; n_cubes];
+        for &c in row_cube {
+            counts[c as usize] += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn partition_bounds_a_clustered_point_set() {
+        // Mass in a 1 mm corner, bbox spread to 2 m by two far points: the
+        // case a uniform grid collapses into one oversized cube (the DC-bus
+        // deck's 7,637-row block).
+        let mut points: Vec<Vector3<f64>> = (0..10_000)
+            .map(|i| Vector3::new((i % 100) as f64 * 1e-5, (i / 100) as f64 * 1e-5, 0.0))
+            .collect();
+        points.push(Vector3::new(1.0, 1.0, 0.0));
+        points.push(Vector3::new(1.0, -1.0, 0.0));
+
+        let target = 110;
+        let (row_cube, n_cubes) = partition_rows(&points, target);
+        assert_eq!(row_cube.len(), points.len());
+        assert!(row_cube.iter().all(|&c| (c as usize) < n_cubes));
+        let counts = leaf_counts(&row_cube, n_cubes);
+        assert!(counts.iter().all(|&c| c > 0), "no empty blocks");
+        let worst = *counts.iter().max().unwrap();
+        assert!(
+            worst <= target,
+            "worst block {worst} exceeds target {target}"
+        );
+    }
+
+    #[test]
+    fn partition_handles_coincident_points() {
+        let points: Vec<Vector3<f64>> = (0..1000).map(|_| Vector3::new(0.0, 0.0, 0.0)).collect();
+        let (row_cube, n_cubes) = partition_rows(&points, 100);
+        let counts = leaf_counts(&row_cube, n_cubes);
+        assert!(counts.iter().all(|&c| c > 0 && c <= 100));
     }
 }
