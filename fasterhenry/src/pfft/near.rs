@@ -42,12 +42,45 @@ fn bounds(bar: &Bar) -> (Vector3<f64>, Vector3<f64>) {
 /// itself) within `radius` of it, ascending. Semantics unchanged by
 /// the `NearBins` code motion: the candidate scan, the j >= i
 /// filter, and the separation retention all moved verbatim.
-pub(crate) fn near_pairs(filaments: &[Filament], radius: f64) -> Vec<Vec<u32>> {
+pub(crate) fn near_pairs(filaments: &[Filament], radius: f64, label: &str) -> Vec<Vec<u32>> {
     let structure = NearBins::build(filaments, radius);
-    (0..structure.bars.len())
+    let bars = structure.bars.len();
+    let start = Instant::now();
+    let pairs_seen = AtomicU64::new(0);
+    let bars_seen = AtomicU64::new(0);
+    let last_printed = AtomicU64::new(0);
+    let lists: Vec<Vec<u32>> = (0..bars)
         .into_par_iter()
-        .map(|index| structure.candidates_for(index, true))
-        .collect()
+        .map(|index| {
+            let list = structure.candidates_for(index, true);
+            pairs_seen.fetch_add(list.len() as u64, Ordering::Relaxed);
+            let done = bars_seen.fetch_add(1, Ordering::Relaxed) + 1;
+            // Progress ticker: at most one line every 20 s of wall, one winner
+            // per slot via compare-exchange (same ticker as `near_pairs_count`;
+            // the cubel pattern build can sit in this walk for minutes and is
+            // otherwise indistinguishable from a hang).
+            let secs = start.elapsed().as_secs();
+            let prev = last_printed.load(Ordering::Relaxed);
+            if secs.saturating_sub(prev) >= 20
+                && last_printed
+                    .compare_exchange(prev, secs, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let pairs = pairs_seen.load(Ordering::Relaxed);
+                let rate = pairs as f64 / 1e9 / start.elapsed().as_secs_f64().max(1e-9);
+                eprintln!(
+                    "{label}: near pairs: bar {index} of {bars} ({done} done), {pairs} candidates, {rate:.2} Gpairs/s"
+                );
+            }
+            list
+        })
+        .collect();
+    eprintln!(
+        "{label}: near pairs: {bars} bars, {} candidates in {:.1} s",
+        pairs_seen.load(Ordering::Relaxed),
+        start.elapsed().as_secs_f64(),
+    );
+    lists
 }
 
 /// The COUNT half of `near_pairs`: per filament the number of neighbors
@@ -639,7 +672,7 @@ mod profile {
         let projection_time = t.elapsed();
 
         let t = Instant::now();
-        let pairs = near_pairs(&filaments, radius);
+        let pairs = near_pairs(&filaments, radius, "test");
         let near_pair_time = t.elapsed();
 
         // From here on, mirrors `precorrect` step by step.
@@ -814,7 +847,7 @@ mod profile {
             }
         }
         let radius = 4.0e-3;
-        let full = near_pairs(&filaments, radius);
+        let full = near_pairs(&filaments, radius, "test");
         // The wanted subset: a vias-involved sample (odd branches
         // include the barrels' neighbours in both directions).
         let wanted: Vec<usize> = (0..filaments.len()).filter(|i| i % 3 == 0).collect();

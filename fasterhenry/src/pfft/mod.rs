@@ -506,7 +506,7 @@ impl PfftOperator {
         let near = if params.precorrect_near {
             eprintln!("pfft: enumerating near-field pairs ...");
             crate::memgate::set_stage(crate::memgate::STAGE_PFFT_OPERATOR);
-            let pairs = near::near_pairs(filaments, radius);
+            let pairs = near::near_pairs(filaments, radius, "pfft");
             let pair_total: usize = pairs.iter().map(|row| row.len()).sum();
             eprintln!(
                 "pfft: near-field census: {} neighbor rows, {} directed pairs, exact ({:.1} GB at 24 B/pair; budget {})",

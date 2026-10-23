@@ -713,7 +713,7 @@ enum Precond<T: ComplexField<RealField = f64> + Copy> {
     Cubel(Box<CubelState<T>>),
     CubelGlobal(Box<CubelGlobalState>),
     /// The coarse/fine (subdivision) precond: factored on the coarse twin.
-    CubelGlobalSub(Box<CubelSubState>),
+    CubelGlobalSub(Box<CubelSubState<T>>),
     TwoLevel(Box<TwoLevelState<T>>),
     Conv(Box<ConvCore>),
 }
@@ -734,12 +734,17 @@ struct CubelGlobalState {
     factors: Option<faer::sparse::linalg::solvers::Lu<u32, crate::cubel::PrecC>>,
 }
 
-/// The coarse/fine ("subdivision") state: the precond factored on the **coarse**
-/// (one-filament-per-segment) twin, plus the loop-space restriction onto its
-/// conductor loops. The fine internal rows `r_off..r_off + c_len` ARE the
-/// coarse's loops (checked at build), so `R`/`P` are a selection there and the
-/// intra-segment (bundle) rows restrict to zero.
-struct CubelSubState {
+/// The coarse/fine ("subdivision") state: a **multiplicative two-level**
+/// preconditioner, `z = B_b^-1 v + P A_c^-1 R (v - Z B_b^-1 v)`. `B_b` is a
+/// full-rank local (block-local) smoother over the fine mesh that covers every
+/// DOF - including the intra-segment (bundle) rows a coarse operator cannot
+/// represent - while the coarse factor `A_c` (built on the one-filament-per-
+/// segment twin) corrects the conductor part of the residual the local
+/// smoother leaves behind. `R`/`P` select the fine conductor block
+/// `r_off..r_off + c_len` (the coarse's loops, checked at build).
+struct CubelSubState<T: ComplexField<RealField = f64> + Copy> {
+    /// The local (`B_b^-1`) smoother: block-local over the fine mesh.
+    local: CubelState<T>,
     factors: Option<faer::sparse::linalg::solvers::Lu<u32, crate::cubel::PrecC>>,
     /// First fine internal row that is a coarse (conductor) loop.
     r_off: usize,
@@ -1000,14 +1005,13 @@ where
 
     /// Builds the coarse/fine ("subdivision") state at `omega`.
     ///
-    /// The precond is factored on the **coarse** (one-filament-per-segment)
-    /// twin (`system.coarse`), so its footprint is the un-subdivided size -
-    /// the point on a subdivided deck. The apply restricts the fine loop
-    /// residual onto the coarse conductor loops, solves the coarse system,
-    /// and prolongates back. `R`/`P` are a selection: the fine's conductor
-    /// rows ARE the coarse's loops (reported at build), and the intra-segment
-    /// (bundle) rows restrict to zero (the deferred smoother's job). With
-    /// `nwinc=nhinc=1` there is no split, so this falls through to
+    /// A **multiplicative two-level** precond. The local block-local smoother
+    /// `B_b` covers every fine DOF (so the map is full rank); the coarse factor
+    /// `A_c` - built on the **coarse** (one-filament-per-segment) twin
+    /// (`system.coarse`), so its footprint is the un-subdivided size - corrects
+    /// the conductor part of the residual `B_b` leaves. `R`/`P` select the
+    /// fine's conductor rows (they ARE the coarse's loops, checked at build).
+    /// With `nwinc=nhinc=1` there is no split, so this falls through to
     /// `cubel-global`.
     fn cubel_global_sub(system: &IterativeSystem, omega: f64) -> Result<Self, SolveError> {
         crate::memgate::set_stage(crate::memgate::STAGE_PRECOND);
@@ -1020,6 +1024,24 @@ where
         }
         let Some(coarse) = &system.coarse else {
             return Self::cubel_global(system, omega);
+        };
+
+        // The local (full-rank) smoother B_b: the same block-local build as
+        // `cubel`, over the fine mesh. Its job is the DOFs no coarse operator
+        // can see (the intra-segment bundle loops).
+        let local_pattern = CubelPattern::build(
+            &system.mesh,
+            &system.filaments,
+            CubelParams {
+                max_block_rows: AVER_ROWS,
+                near_radius: system.operator.near_radius(),
+            },
+        )?;
+        let local_factors =
+            local_pattern.factor_blocks::<T>(&system.mesh, &system.resistances, omega);
+        let local = CubelState {
+            pattern: local_pattern,
+            factors: local_factors,
         };
 
         let radius_mult: f64 = std::env::var("FASTERHENRY_CUBEL_RADIUS_MULT")
@@ -1037,8 +1059,9 @@ where
         .map_err(SolveError::from)?;
         let factors = cglobal.factor(omega);
 
-        // R/P select the fine's conductor block (the trailing rows); the
-        // bundle rows are intra-segment and restrict to zero.
+        // R/P select the fine's conductor block (the trailing rows) for the
+        // coarse correction; the bundle rows are intra-segment, invisible to
+        // any coarse operator, and are handled by B_b alone.
         let r_off = system.intra_loop_count();
         let c_len = coarse.mesh.internal_count();
         assert_eq!(
@@ -1056,6 +1079,7 @@ where
         }
 
         Ok(Self::CubelGlobalSub(Box::new(CubelSubState {
+            local,
             factors,
             r_off,
             c_len,
@@ -1100,7 +1124,10 @@ where
         Ok(Self::TwoLevel(Box::new(TwoLevelState { pattern, factors })))
     }
 
-    fn run(&self, v: &[T]) -> Vec<T> {
+    /// Applies the preconditioner to `v`. `op` is the system's own operator
+    /// (`Z`); only the multiplicative two-level precond needs it, for the
+    /// residual `v - Z B_b^-1 v` - the rest ignore it.
+    fn run(&self, v: &[T], op: &dyn Fn(&[T]) -> Vec<T>) -> Vec<T> {
         match self {
             Self::Jacobi(d) => v.iter().zip(d.iter()).map(|(&v, &d)| v / d).collect(),
             Self::Identity => v.to_vec(),
@@ -1109,13 +1136,21 @@ where
                 CubelGlobal::apply_global(state.factors.as_ref(), state.global.n(), v)
             }
             Self::CubelGlobalSub(state) => {
-                // z = P (A_c^-1) (R v): restrict onto the coarse loops, solve
-                // the coarse system, prolongate back. R/P are the selection of
-                // the fine's conductor block (the bundle rows map to zero).
-                let mut z = vec![T::zero(); v.len()];
-                let rv = &v[state.r_off..state.r_off + state.c_len];
-                let solved = CubelGlobal::apply_global(state.factors.as_ref(), state.c_len, rv);
-                z[state.r_off..state.r_off + state.c_len].copy_from_slice(&solved);
+                // Multiplicative two-level:
+                //   z = B_b^-1 v + P A_c^-1 R (v - Z B_b^-1 v)
+                // B_b is the block-local fine smoother (full rank); the coarse
+                // step corrects the conductor part of the residual it leaves.
+                let zb = state.local.pattern.apply_blocks(&state.local.factors, v);
+                let w = op(&zb);
+                let mut rc = vec![T::zero(); state.c_len];
+                for j in 0..state.c_len {
+                    rc[j] = v[state.r_off + j] - w[state.r_off + j];
+                }
+                let sc = CubelGlobal::apply_global(state.factors.as_ref(), state.c_len, &rc);
+                let mut z = zb;
+                for j in 0..state.c_len {
+                    z[state.r_off + j] += sc[j];
+                }
                 z
             }
             Self::TwoLevel(state) => state.pattern.apply(&state.factors, v),
@@ -1312,7 +1347,13 @@ where
     for port in 0..ep.ncols() {
         let rhs: Vec<T> = ep.column(port).iter().copied().collect();
         let mut x = vec![T::zero(); internal];
-        let outcome = gmres(&apply_ee, |v: &[T]| precond.run(v), &rhs, &mut x, params);
+        let outcome = gmres(
+            &apply_ee,
+            |v: &[T]| precond.run(v, &apply_ee),
+            &rhs,
+            &mut x,
+            params,
+        );
         if !outcome.converged {
             return Err(SolveError::NotConverged {
                 frequency,

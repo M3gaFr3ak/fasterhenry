@@ -153,9 +153,12 @@ impl CubelPattern {
         // shared-branch gather below handles the self pair, with its
         // resistance). Same pair enumeration as `precorrect`, minus the
         // grid part.
-        let pairs = near_pairs(filaments, params.near_radius);
+        let pairs = near_pairs(filaments, params.near_radius, "cubel");
         let mut partners: Vec<Vec<(u32, f64)>> = vec![Vec::new(); branches];
         let self_l: Vec<f64> = filaments.iter().map(self_inductance).collect();
+        // One mutual per near pair (order 1e8 on the subdivided decks), serially:
+        // meter it so the phase is never a silent multi-minute span.
+        let report_step = (branches / 20).max(1);
         for a in 0..branches {
             let direction = filaments[a].direction();
             for &j in &pairs[a] {
@@ -169,22 +172,40 @@ impl CubelPattern {
                 let m = mutual_inductance(&filaments[a], &filaments[j])?;
                 partners[a].push((j as u32, m));
             }
+            if (a + 1) % report_step == 0 {
+                eprintln!("cubel: partners {}/{}", a + 1, branches);
+            }
         }
-        for list in &mut partners {
+        let sort_wall = std::time::Instant::now();
+        let sort_step = (branches / 20).max(1);
+        for (i, list) in partners.iter_mut().enumerate() {
             list.sort_by_key(|&(p, _)| p);
+            if (i + 1) % sort_step == 0 {
+                eprintln!("cubel: sorting partners {}/{}", i + 1, branches);
+            }
         }
+        eprintln!(
+            "cubel: sorted partners in {:.3} s",
+            sort_wall.elapsed().as_secs_f64()
+        );
 
         // Branch → internal rows incidence.
+        let br_wall = std::time::Instant::now();
         let mut branch_rows: Vec<Vec<u32>> = vec![Vec::new(); branches];
         for row in 0..internal {
             for &(b, _) in mesh.row(row) {
                 branch_rows[b].push(row as u32);
             }
         }
+        eprintln!(
+            "cubel: branch rows in {:.3} s",
+            br_wall.elapsed().as_secs_f64()
+        );
 
         // The row's cube is the cube of its longest filament: a mesh row is
         // the reduced node of a parallel bundle, and the longest member
         // carries the row's geometric identity.
+        let lb_wall = std::time::Instant::now();
         let longest_branch: Vec<u32> = (0..internal)
             .map(|row| {
                 mesh.row(row)
@@ -198,9 +219,14 @@ impl CubelPattern {
                     .unwrap_or(0)
             })
             .collect();
+        eprintln!(
+            "cubel: longest-branch in {:.3} s",
+            lb_wall.elapsed().as_secs_f64()
+        );
 
         // Cube partition: two passes of one sizing rule - partition,
         // measure the worst row block, rescale once, re-partition.
+        let part_wall = std::time::Instant::now();
         let centres: Vec<_> = filaments.iter().map(|f| f.center()).collect();
         let rows_per_branch = (internal as f64 / branches as f64).max(1.0 / 1024.0);
         let target_fils = (params.max_block_rows as f64 / rows_per_branch).max(1.0);
@@ -210,16 +236,25 @@ impl CubelPattern {
             edge *= (state.worst as f64 / params.max_block_rows as f64).sqrt();
             state = partition_state(&centres, edge, &longest_branch, internal);
         }
+        eprintln!(
+            "cubel: cube partition in {:.3} s",
+            part_wall.elapsed().as_secs_f64()
+        );
         let n_cubes = state
             .row_cube
             .iter()
             .copied()
             .max()
             .map_or(0, |c| c as usize + 1);
+        let cr_wall = std::time::Instant::now();
         let mut cube_rows: Vec<Vec<u32>> = vec![Vec::new(); n_cubes];
         for row in 0..internal {
             cube_rows[state.row_cube[row] as usize].push(row as u32);
         }
+        eprintln!(
+            "cubel: cube rows in {:.3} s",
+            cr_wall.elapsed().as_secs_f64()
+        );
         eprintln!(
             "cubel: {} cubes, edge {:.4e} m, worst rows/cube {}",
             n_cubes,
@@ -546,7 +581,7 @@ pub(crate) fn near_pair_data(
     near_radius: f64,
 ) -> Result<NearPairData, KernelError> {
     let branches = filaments.len();
-    let pairs = near_pairs(filaments, near_radius);
+    let pairs = near_pairs(filaments, near_radius, "cubel-global");
     // Kernel evaluations dominate this stage at 80k+ branches; the pair
     // list per branch is independent, so rayon over branch indices
     // preserves the exact kernel set (each pair computed once, upper
